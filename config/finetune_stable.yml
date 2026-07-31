@@ -1,0 +1,61 @@
+exp_name: vina_rescue_run7
+run_name: run7_stable
+device: gpu
+seed: 42
+
+data: data
+train_data_prefix: crossdocked_pocket10
+val_data_prefix: crossdocked_pocket10
+dataset: crossdock
+
+model: egnn_dynamics
+n_layers: 6
+nf: 128
+attention: true
+tanh: true
+activation: silu
+normalization: batch_norm
+aggregation_method: sum
+normalization_factor: 1.0
+inv_sublayers: 1
+norm_constant: 1.0
+sin_embedding: false
+no_wandb: true
+
+diffusion_steps: 500
+diffusion_noise_schedule: cosine
+diffusion_noise_precision: 1.0e-5
+diffusion_loss_type: l2
+
+n_epochs: 15
+batch_size: 4
+accumulate_grad_batches: 4
+precision: 32
+lr: 0.00001
+gradient_clip_val: 1.0
+
+lambda_pocket_clash: 1.0
+lambda_contact: 0.1
+lambda_attach: 1.0
+lambda_connectivity: 0.2
+lambda_gf: 0.5
+bond_class_weights_file: data/crossdocked_pocket10_bond_class_weights.json
+corrective_freeze_epochs: 3
+pocket_encoder_lr_multiplier: 0.1
+bond_head_lr_multiplier: 1.0
+clash_warmup_epochs: 3
+
+data_augmentation: false
+center_of_mass: fragments
+inpainting: false
+remove_anchors_context: false
+include_charges: true
+graph_type: FC
+normalize_factors: [1, 4, 1]
+
+checkpoints: checkpoints
+logs: logs
+log_iterations: 20
+test_epochs: 5
+enable_progress_bar: true
+num_workers: 0

@@ -1,0 +1,27 @@
+{
+  "samples_requested": 91825,
+  "samples_failed": 0,
+  "counts": [
+    534125,
+    268023,
+    8113,
+    0,
+    0
+  ],
+  "frequencies": [
+    0.6592011709807087,
+    0.33078600599066227,
+    0.010012823028629046,
+    0.0,
+    0.0
+  ],
+  "weights": [
+    0.2850194586249288,
+    0.4023554902411603,
+    2.312625051133911,
+    0.0,
+    0.0
+  ],
+  "method": "inverse_sqrt_frequency_present_mean_normalized_clipped_0.1_5.0",
+  "undirected_upper_triangle_only": true
+}
