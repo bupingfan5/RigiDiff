@@ -1,7 +1,9 @@
 import argparse
+import csv
 import json
 import os
 import pwd
+import re
 import sys
 import yaml
 import torch
@@ -29,6 +31,106 @@ class DelayedEarlyStopping(callbacks.EarlyStopping):
         return super()._run_early_stopping_check(trainer)
 
 
+class EpochMetricsCSVLogger(callbacks.Callback):
+    """Persist one train/validation metric row after every validation epoch."""
+
+    METRIC_NAMES = (
+        "loss",
+        "loss_x",
+        "loss_rot",
+        "loss_rep",
+        "loss_bond",
+        "loss_gf",
+        "loss_type",
+        "loss_connectivity",
+        "bond_precision",
+        "bond_recall",
+        "predicted_no_bond_rate",
+        "isolated_fragment_rate",
+        "loss_attach",
+        "loss_pocket_clash",
+        "loss_contact",
+        "pocket_clash_rate",
+        "pocket_min_distance",
+    )
+
+    def __init__(self, log_dir):
+        super().__init__()
+        self.csv_path = os.path.join(log_dir, "epoch_metrics.csv")
+        self.metric_columns = [
+            f"{metric_name}/{split}"
+            for split in ("train", "val")
+            for metric_name in self.METRIC_NAMES
+        ]
+        self.fieldnames = [
+            "epoch",
+            "completed_epochs",
+            "global_step",
+            "learning_rates",
+            "val_minus_train_loss",
+            *self.metric_columns,
+        ]
+
+    @staticmethod
+    def _to_float(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().cpu().item())
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+
+        callback_metrics = trainer.callback_metrics
+        row = {field: "" for field in self.fieldnames}
+        # Lightning's ``{epoch}`` checkpoint token is zero-based, so keeping
+        # this value zero-based makes every CSV row map directly to a ckpt.
+        row["epoch"] = int(trainer.current_epoch)
+        row["completed_epochs"] = int(trainer.current_epoch) + 1
+        row["global_step"] = int(trainer.global_step)
+        row["learning_rates"] = ";".join(
+            f"{group['lr']:.12g}"
+            for optimizer in trainer.optimizers
+            for group in optimizer.param_groups
+        )
+
+        for column in self.metric_columns:
+            value = self._to_float(callback_metrics.get(column))
+            if value is not None:
+                row[column] = value
+
+        train_loss = self._to_float(callback_metrics.get("loss/train"))
+        val_loss = self._to_float(callback_metrics.get("loss/val"))
+        if train_loss is not None and val_loss is not None:
+            row["val_minus_train_loss"] = val_loss - train_loss
+
+        write_header = not os.path.isfile(self.csv_path) or os.path.getsize(self.csv_path) == 0
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        def display(value):
+            return "n/a" if value is None else f"{value:.6f}"
+
+        gap = None if train_loss is None or val_loss is None else val_loss - train_loss
+        print(
+            "\n[Epoch Summary] "
+            f"checkpoint_epoch={row['epoch']} completed_epochs={row['completed_epochs']} "
+            f"global_step={row['global_step']} "
+            f"train_loss={display(train_loss)} val_loss={display(val_loss)} "
+            f"val_minus_train={display(gap)} | csv={self.csv_path}"
+        )
+
+
 def reset_rigid_rotation_outputs(model):
     """Reset only the rotation rows of every rigid update output layer."""
     reset_count = 0
@@ -48,11 +150,18 @@ def reset_rigid_rotation_outputs(model):
 
 
 def find_last_checkpoint(checkpoints_dir):
-    epoch2fname = [
-        (int(fname.split('=')[1].split('.')[0]), fname)
-        for fname in os.listdir(checkpoints_dir)
-        if fname.endswith('.ckpt')
-    ]
+    last_path = os.path.join(checkpoints_dir, 'last.ckpt')
+    if os.path.isfile(last_path):
+        return last_path
+    epoch2fname = []
+    for fname in os.listdir(checkpoints_dir):
+        if not fname.endswith('.ckpt'):
+            continue
+        match = re.search(r'epoch[=_-]?(\d+)', fname)
+        if match:
+            epoch2fname.append((int(match.group(1)), fname))
+    if not epoch2fname:
+        raise FileNotFoundError(f'No resumable checkpoint found in {checkpoints_dir}')
     latest_fname = max(epoch2fname, key=lambda t: t[0])[1]
     return os.path.join(checkpoints_dir, latest_fname)
 
@@ -95,8 +204,9 @@ def main(args):
     )
     if 'PDBbind' in args.train_data_prefix or 'MOAD' in args.train_data_prefix or is_crossdock:
         from src.const import GEOM_NUMBER_OF_FRAGMENT_TYPES
-        in_node_nf = GEOM_NUMBER_OF_FRAGMENT_TYPES
+        in_node_nf = GEOM_NUMBER_OF_FRAGMENT_TYPES  # 此时为 22
     else:
+        # 保持旧的小分子原子级逻辑
         number_of_atoms = GEOM_NUMBER_OF_ATOM_TYPES if is_geom else NUMBER_OF_ATOM_TYPES
         in_node_nf = number_of_atoms + args.include_charges
     # number_of_atoms = GEOM_NUMBER_OF_ATOM_TYPES if is_geom else NUMBER_OF_ATOM_TYPES
@@ -115,6 +225,7 @@ def main(args):
             f"{args.bond_class_weights}"
         )
 
+    # 在 train_fragdiff.py 中调整
     ddpm = DDPM(
         data_path=args.data,
         train_data_prefix=args.train_data_prefix,
@@ -164,6 +275,14 @@ def main(args):
         bond_head_lr_multiplier=args.bond_head_lr_multiplier,
         rigid_head_lr_multiplier=args.rigid_head_lr_multiplier,
         clash_warmup_epochs=args.clash_warmup_epochs,
+        split_file=args.split_file,
+        fragment_vocab_path=args.fragment_vocab_path,
+        lr_scheduler=args.lr_scheduler,
+        warmup_fraction=args.warmup_fraction,
+        warmup_start_lr_ratio=args.warmup_start_lr_ratio,
+        min_lr_ratio=args.min_lr_ratio,
+        ema_decay=args.ema_decay,
+        weight_decay=args.weight_decay,
     )
 
     if args.init_checkpoint:
@@ -219,14 +338,30 @@ def main(args):
         "dirpath": checkpoints_dir,
         "filename": experiment + '_{epoch:02d}',
         "save_last": True,
-        "every_n_epochs": 1,
+        "every_n_epochs": args.checkpoint_every_n_epochs,
     }
     if args.save_all_checkpoints:
         checkpoint_kwargs.update(monitor=None, save_top_k=-1)
     else:
         checkpoint_kwargs.update(monitor='loss/val', mode='min', save_top_k=3)
     checkpoint_callback = callbacks.ModelCheckpoint(**checkpoint_kwargs)
-    trainer_callbacks = [checkpoint_callback]
+    best_val_callback = None
+    if args.save_all_checkpoints:
+        best_val_callback = callbacks.ModelCheckpoint(
+            dirpath=os.path.join(checkpoints_dir, "best_val"),
+            filename=experiment + '_best_val_{epoch:02d}',
+            monitor='loss/val',
+            mode='min',
+            save_top_k=3,
+            save_last=False,
+            every_n_epochs=1,
+        )
+    epoch_metrics_callback = EpochMetricsCSVLogger(
+        os.path.join(args.logs, "general_logs", experiment)
+    )
+    trainer_callbacks = [checkpoint_callback, epoch_metrics_callback]
+    if best_val_callback is not None:
+        trainer_callbacks.append(best_val_callback)
     if args.early_stopping_patience > 0:
         trainer_callbacks.append(DelayedEarlyStopping(
             start_epoch=args.early_stopping_start_epoch,
@@ -255,6 +390,12 @@ def main(args):
 
     print('Start training')
     trainer.fit(model=ddpm, ckpt_path=last_checkpoint)
+    selected_callback = best_val_callback or checkpoint_callback
+    if selected_callback.best_model_path:
+        print(
+            f"Best validation checkpoint: {selected_callback.best_model_path} | "
+            f"loss/val={selected_callback.best_model_score}"
+        )
 
 
 if __name__ == '__main__':
@@ -283,6 +424,16 @@ if __name__ == '__main__':
     p.add_argument('--n_epochs', type=int, default=200)
     p.add_argument('--batch_size', type=int, default=128)
     p.add_argument('--lr', type=float, default=2e-4)
+    p.add_argument('--weight_decay', type=float, default=1e-12,
+                   help='AdamW weight decay')
+    p.add_argument('--lr_scheduler', type=str, default='constant',
+                   choices=['constant', 'warmup_cosine'])
+    p.add_argument('--warmup_fraction', type=float, default=0.05,
+                   help='Fraction of optimizer update steps used for linear warmup')
+    p.add_argument('--warmup_start_lr_ratio', type=float, default=0.05,
+                   help='Initial LR divided by peak LR during warmup')
+    p.add_argument('--min_lr_ratio', type=float, default=0.05,
+                   help='Final cosine LR divided by peak LR')
     p.add_argument('--gradient_clip_val', type=float, default=1.0)
     p.add_argument('--precision', type=int, default=32, choices=[16, 32], help='Trainer arithmetic precision')
     p.add_argument('--accumulate_grad_batches', type=int, default=1)
@@ -307,6 +458,12 @@ if __name__ == '__main__':
                    help='Reset rotation rows in rigid update heads after loading --init_checkpoint')
     p.add_argument('--save_all_checkpoints', action='store_true',
                    help='Keep every epoch checkpoint for downstream pose/Vina model selection')
+    p.add_argument('--checkpoint_every_n_epochs', type=int, default=1,
+                   help='Checkpoint interval in completed training epochs')
+    p.add_argument('--split_file', type=str, default=None,
+                   help='Explicit train/val/test split file for CrossDock training')
+    p.add_argument('--fragment_vocab_path', type=str, default=None,
+                   help='Explicit fragment vocabulary matching the training LMDB')
     p.add_argument('--early_stopping_patience', type=int, default=0)
     p.add_argument('--early_stopping_start_epoch', type=int, default=30)
     p.add_argument('--brute_force', type=eval, default=False,help='True | False')
@@ -345,7 +502,8 @@ if __name__ == '__main__':
     p.add_argument('--init_checkpoint', type=str, default=None,
                    help='Load model weights only; unlike --resume this does not restore optimizer state')
     p.add_argument('--start_epoch', type=int, default=0, help='')
-    p.add_argument('--ema_decay', type=float, default=0.999, help='Amount of EMA decay, 0 means off. A reasonable value is 0.999.')
+    p.add_argument('--ema_decay', type=float, default=0.0,
+                   help='EMA decay for model weights; 0 disables EMA')
     p.add_argument('--augment_noise', type=float, default=0)
     p.add_argument('--n_stability_samples', type=int, default=500,help='Number of samples to compute the stability')
     p.add_argument('--normalize_factors', type=eval, default=[1, 4, 1], help='normalize factors for [x, categorical, integer]')
@@ -377,4 +535,6 @@ if __name__ == '__main__':
         args.config = args.config.name
     else:
         config_dict = {}
+    if args.checkpoint_every_n_epochs < 1:
+        raise ValueError('--checkpoint_every_n_epochs must be at least 1')
     main(args=args)

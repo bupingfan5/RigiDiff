@@ -16,7 +16,7 @@ if PROJECT_ROOT not in sys.path:
 
 RDLogger.DisableLog("rdApp.*")
 
-
+# 引入合成可及性打分
 try:
     from src import sascorer
 except ImportError:
@@ -24,7 +24,10 @@ except ImportError:
 
 
 def calculate_sa_score(mol):
-    'Compute the normalized synthetic-accessibility score.'
+    """
+    DiffGui 论文评估口径的 SA：将原始 Ertl SA Score(1~10，越低越好)
+    转换为 0~1 区间的合成可及性指标（越高越好）。
+    """
     if sascorer is None:
         return np.nan
 
@@ -41,13 +44,17 @@ def calculate_sa_score(mol):
 
 
 def count_lipinski_rules(mol):
-    'Count satisfied Lipinski-style drug-likeness rules.'
+    """
+    计算符合 Lipinski 五规则的条数。
+    为了对齐 TargetDiff / Pocket2Mol 等顶会论文的评测标准，
+    此处加入第5条规则（可旋转键<=10），使满分达到 5.0。
+    """
     try:
         mw = Descriptors.MolWt(mol)
         logp = Descriptors.MolLogP(mol)
         hbd = rdMolDescriptors.CalcNumHBD(mol)
         hba = rdMolDescriptors.CalcNumHBA(mol)
-        
+        # 🌟 顶会评测脚本里用来凑满 5 分的潜规则
         rot_bonds = rdMolDescriptors.CalcNumRotatableBonds(mol)
 
         score = 0
@@ -92,22 +99,22 @@ def extract_pocket_id(file_name):
 
 
 def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
-    
+    # 检查路径
     if not os.path.exists(sdf_dir):
-        print(f"[Error] Directory does not exist: {sdf_dir}")
+        print(f"[Error] 路径不存在: {sdf_dir}")
         return
 
     sdf_files = glob.glob(os.path.join(sdf_dir, "*.sdf"))
-    print(f"[Start] Found {len(sdf_files)} molecule files; running standard evaluation...")
+    print(f"[Start] 找到 {len(sdf_files)} 个分子文件，开始标准评估...")
 
     results = []
     fps_by_pocket = defaultdict(list)
     result_indices_by_pocket = defaultdict(list)
 
     # ==========================================
-    
+    # 第一阶段：提取基础理化属性、拓扑信息和 RDKit 拓扑指纹
     # ==========================================
-    for f in tqdm(sdf_files, desc="1/2 Evaluating molecular properties", file=sys.stdout):
+    for f in tqdm(sdf_files, desc="1/2 评估基础理化属性", file=sys.stdout):
         file_name = os.path.basename(f)
         pocket_id = extract_pocket_id(file_name)
 
@@ -120,19 +127,19 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
 
                 Chem.SanitizeMol(mol)
 
-                
+                # 计算 DiffGui 论文口径的 SA：0~1，越高越好
                 sa_val = calculate_sa_score(mol)
 
-                
+                # 计算常规药效学指标
                 qed_val = QED.qed(mol)
                 lipinski_score = count_lipinski_rules(mol)
                 mw = Descriptors.MolWt(mol)
                 logp = Descriptors.MolLogP(mol)
 
-                
+                # 🌟 新增：统计成环个数
                 num_rings = mol.GetRingInfo().NumRings()
 
-                
+                # 🌟 新增：统计化学键及其类型
                 num_bonds = mol.GetNumBonds()
                 bond_single = 0
                 bond_double = 0
@@ -150,7 +157,7 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
                     elif bt == Chem.rdchem.BondType.AROMATIC:
                         bond_aromatic += 1
 
-                
+                # 使用与 TargetDiff、PMDM 和 GCDM 一致的默认 RDKit 拓扑指纹
                 fp = Chem.RDKFingerprint(mol)
                 result_index = len(results)
                 fps_by_pocket[pocket_id].append(fp)
@@ -164,24 +171,24 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
                     "MW": mw,
                     "LogP": logp,
                     "Atoms": mol.GetNumAtoms(),
-                    "Rings": num_rings,  
-                    "Total_Bonds": num_bonds,  
-                    "Single_Bonds": bond_single,  
-                    "Double_Bonds": bond_double,  
-                    "Triple_Bonds": bond_triple,  
-                    "Aromatic_Bonds": bond_aromatic  
+                    "Rings": num_rings,  # 新增写入表格
+                    "Total_Bonds": num_bonds,  # 新增写入表格
+                    "Single_Bonds": bond_single,  # 新增写入表格
+                    "Double_Bonds": bond_double,  # 新增写入表格
+                    "Triple_Bonds": bond_triple,  # 新增写入表格
+                    "Aromatic_Bonds": bond_aromatic  # 新增写入表格
                 })
             except Exception as e:
                 continue
 
     if not results:
-        print("[Warning] No molecules were evaluated. Check that the SDF files are valid.")
+        print("[Warning] 未成功评估任何分子，请检查 SDF 文件是否有效。")
         return
 
     # ==========================================
-    
+    # 第二阶段：逐口袋计算平均两两 Tanimoto 距离并写入表格
     # ==========================================
-    print("\n[Progress] 2/2 Computing per-pocket structural diversity...")
+    print("\n[Progress] 2/2 正在计算逐口袋结构多样性 (Diversity)...")
     per_pocket_diversity = {}
     for pocket_id, pocket_fps in tqdm(
         fps_by_pocket.items(),
@@ -193,12 +200,12 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
         for result_index in result_indices_by_pocket[pocket_id]:
             results[result_index]["Diversity"] = diversity
 
-    
+    # 存入 CSV
     df = pd.DataFrame(results)
     df.to_csv(output_csv, index=False)
 
     # ==========================================
-    
+    # 第三阶段：打印终端统计报表
     # ==========================================
     diversity_values = np.asarray(list(per_pocket_diversity.values()), dtype=float)
     macro_diversity = float(np.mean(diversity_values))
@@ -206,24 +213,24 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
     std_diversity = float(np.std(diversity_values))
 
     print("\n" + "=" * 55)
-    print("Standard Metrics")
+    print("论文统计报表 (Standard Metrics)")
     print("=" * 55)
-    print(f"Successful samples: {len(results)}")
-    print(f"Mean QED: {df['QED'].mean():.4f}")
-    print(f"Mean SA (0-1): {df['SA_Score'].mean():.4f} (higher is better)")
-    print(f"Mean Lipinski score: {df['Lipinski'].mean():.2f} / 5.0")
-    print(f"Mean molecular weight: {df['MW'].mean():.2f}")
-    print(f"Mean ring count: {df['Rings'].mean():.2f}")
-    print(f"Mean bond count: {df['Total_Bonds'].mean():.2f}")
-    print(f"Per-pocket diversity (macro mean): {macro_diversity:.4f} (higher is better)")
-    print(f"Per-pocket diversity (median): {median_diversity:.4f}")
-    print(f"Per-pocket diversity (std): {std_diversity:.4f}")
-    print(f"Pockets included in diversity aggregation: {len(per_pocket_diversity)}")
+    print(f"总成功样本数:     {len(results)}")
+    print(f"平均 QED (类药性):   {df['QED'].mean():.4f}")
+    print(f"平均 SA (0~1 合成可及性): {df['SA_Score'].mean():.4f} (越高越好)")
+    print(f"平均 Lipinski 得分:   {df['Lipinski'].mean():.2f} / 5.0")
+    print(f"平均分子量 (MW):      {df['MW'].mean():.2f}")
+    print(f"平均成环数 (Rings):   {df['Rings'].mean():.2f}")
+    print(f"平均化学键数:        {df['Total_Bonds'].mean():.2f}")
+    print(f"逐口袋结构多样性（宏平均）: {macro_diversity:.4f} (接近1越好)")
+    print(f"逐口袋结构多样性（中位数）: {median_diversity:.4f}")
+    print(f"逐口袋结构多样性（标准差）: {std_diversity:.4f}")
+    print(f"参与 Diversity 汇总的口袋数: {len(per_pocket_diversity)}")
     print("=" * 55)
-    print(f"Saved full results to: {output_csv}")
+    print(f"完整数据已保存至: {output_csv}")
 
 
 if __name__ == "__main__":
-    
-    SDF_PATH = "samples/final run/candidates"
+    # 确保此路径下有你刚才生成的 SDF 文件
+    SDF_PATH = "samples/final run1/candidates"
     evaluate_folder(SDF_PATH)

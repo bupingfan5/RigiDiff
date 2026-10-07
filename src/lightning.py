@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import os
 import pytorch_lightning as pl
 import torch
@@ -11,7 +12,7 @@ from src import utils
 import time
 from src.egnn import Dynamics, DynamicsWithPockets
 from src.edm import EDM, InpaintingEDM
-from src.fragment_vocab import ensure_fragment_vocabulary
+from src.fragment_vocab import ensure_fragment_vocabulary, load_fragment_vocabulary
 from src.pocket_geometry import center_ligand_and_pocket
 from src.datasets import (
     ZincDataset, MOADDataset, get_dataloader, collate_with_fragment_edges
@@ -30,7 +31,7 @@ from src.visualizer import save_xyz_file, visualize_chain
 # ==============================================================================
 # ==============================================================================
 def compute_repulsive_force(x, node_mask, r_vdw=1.0, strength=0.1):
-    'Compute repulsive gradients for close atom pairs.'
+    """【步骤一】计算空间排斥力梯度，防止原子极端堆叠 (0.04埃重合问题)"""
     with torch.enable_grad():
         x = x.detach().clone().requires_grad_(True)
         dist_sq = torch.sum((x.unsqueeze(1) - x.unsqueeze(2)) ** 2, dim=-1)
@@ -53,14 +54,14 @@ def compute_repulsive_force(x, node_mask, r_vdw=1.0, strength=0.1):
 
 
 def prevent_z_collapse(x, node_mask, eps=1e-2):
-    'Repair degenerate coordinate variance along the z-axis.'
-    B = x.shape[0]  
+    """【步骤二】检测并修复维度塌陷 (Z轴方差丢失问题)"""
+    B = x.shape[0]  # 提取 batch size
     x_out = x.clone()
     for b in range(B):
         valid_mask = node_mask[b].squeeze(-1) > 0.5
         valid_x = x_out[b][valid_mask]
 
-        if valid_x.shape[0] < 3:  
+        if valid_x.shape[0] < 3:  #  检查节点数量是否小于3
             continue
 
         var_3d = torch.var(valid_x, dim=0)
@@ -80,6 +81,30 @@ def get_activation(activation):
         raise Exception("activation fn not supported yet. Add it here.")
 
 
+def warmup_cosine_multiplier(
+    current_step,
+    total_steps,
+    warmup_steps,
+    warmup_start_lr_ratio,
+    min_lr_ratio,
+):
+    """Return a linear-warmup then single-cycle cosine-decay LR multiplier."""
+    current_step = min(max(int(current_step), 0), int(total_steps))
+    total_steps = max(int(total_steps), 1)
+    warmup_steps = min(max(int(warmup_steps), 1), total_steps)
+
+    if current_step <= warmup_steps:
+        warmup_progress = current_step / warmup_steps
+        return warmup_start_lr_ratio + (
+            1.0 - warmup_start_lr_ratio
+        ) * warmup_progress
+
+    decay_steps = max(total_steps - warmup_steps, 1)
+    decay_progress = min((current_step - warmup_steps) / decay_steps, 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
 class DDPM(pl.LightningModule):
     def __init__(self, in_node_nf, n_dims, context_node_nf, hidden_nf, activation, tanh, n_layers, attention,
                  norm_constant, inv_sublayers, sin_embedding, normalization_factor, aggregation_method, diffusion_steps,
@@ -96,7 +121,15 @@ class DDPM(pl.LightningModule):
                  pocket_encoder_lr_multiplier: float = 10.0,
                  bond_head_lr_multiplier: float = 3.0,
                  rigid_head_lr_multiplier: float = 20.0,
-                 clash_warmup_epochs: int = 10):
+                 clash_warmup_epochs: int = 10,
+                 split_file: Optional[str] = None,
+                 fragment_vocab_path: Optional[str] = None,
+                 lr_scheduler: str = 'constant',
+                 warmup_fraction: float = 0.05,
+                 warmup_start_lr_ratio: float = 0.05,
+                 min_lr_ratio: float = 0.05,
+                 ema_decay: float = 0.0,
+                 weight_decay: float = 1e-12):
         super(DDPM, self).__init__()
         self.save_hyperparameters()
         self.data_path = data_path
@@ -122,6 +155,31 @@ class DDPM(pl.LightningModule):
         self.pocket_encoder_lr_multiplier = float(pocket_encoder_lr_multiplier)
         self.bond_head_lr_multiplier = float(bond_head_lr_multiplier)
         self.rigid_head_lr_multiplier = float(rigid_head_lr_multiplier)
+        self.split_file = split_file
+        self.fragment_vocab_path = fragment_vocab_path
+        self.lr_scheduler = str(lr_scheduler).lower().strip()
+        self.warmup_fraction = float(warmup_fraction)
+        self.warmup_start_lr_ratio = float(warmup_start_lr_ratio)
+        self.min_lr_ratio = float(min_lr_ratio)
+        self.ema_decay = float(ema_decay)
+        self.weight_decay = float(weight_decay)
+        self._ema_state = {}
+        self._ema_num_updates = 0
+        if self.lr_scheduler not in {'constant', 'warmup_cosine'}:
+            raise ValueError(
+                f"Unsupported lr_scheduler={lr_scheduler!r}; "
+                "expected 'constant' or 'warmup_cosine'."
+            )
+        if not 0.0 < self.warmup_fraction < 1.0:
+            raise ValueError("warmup_fraction must be strictly between 0 and 1")
+        if not 0.0 <= self.warmup_start_lr_ratio <= 1.0:
+            raise ValueError("warmup_start_lr_ratio must be between 0 and 1")
+        if not 0.0 <= self.min_lr_ratio <= 1.0:
+            raise ValueError("min_lr_ratio must be between 0 and 1")
+        if not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError("ema_decay must be in [0, 1)")
+        if self.weight_decay < 0.0:
+            raise ValueError("weight_decay must be non-negative")
         train_prefix_lower = self.train_data_prefix.lower()
         val_prefix_lower = self.val_data_prefix.lower()
         self.is_crossdock = (
@@ -150,7 +208,12 @@ class DDPM(pl.LightningModule):
         )
         if uses_fragment_vocab:
             try:
-                self.fragment_vocab = ensure_fragment_vocabulary(data_path, fragment_prefix.split('.')[0])
+                if self.fragment_vocab_path:
+                    self.fragment_vocab = load_fragment_vocabulary(self.fragment_vocab_path)
+                else:
+                    self.fragment_vocab = ensure_fragment_vocabulary(
+                        data_path, fragment_prefix.split('.')[0]
+                    )
                 effective_in_node_nf = const.GEOM_NUMBER_OF_FRAGMENT_TYPES
             except Exception as exc:
                 print(f"[DDPM] fragment vocabulary bootstrap failed, falling back to in_node_nf={in_node_nf}: {exc}")
@@ -181,6 +244,92 @@ class DDPM(pl.LightningModule):
             bond_class_weights=bond_class_weights,
         )
 
+    @torch.no_grad()
+    def _initialize_ema(self):
+        """Initialize EMA after Lightning has moved the module to its device."""
+        self._ema_state = {
+            name: value.detach().clone()
+            for name, value in self.edm.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def _update_ema(self):
+        if self.ema_decay <= 0.0:
+            return
+        current_state = self.edm.state_dict()
+        if not self._ema_state:
+            self._initialize_ema()
+        for name, value in current_state.items():
+            shadow = self._ema_state.get(name)
+            if (
+                shadow is None
+                or shadow.shape != value.shape
+                or shadow.device != value.device
+                or shadow.dtype != value.dtype
+            ):
+                self._ema_state[name] = value.detach().clone()
+            elif torch.is_floating_point(value) or torch.is_complex(value):
+                shadow.mul_(self.ema_decay).add_(value.detach(), alpha=1.0 - self.ema_decay)
+            else:
+                shadow.copy_(value.detach())
+        self._ema_num_updates += 1
+
+    @torch.no_grad()
+    def apply_ema_weights(self):
+        """Copy checkpoint EMA weights into the sampling model."""
+        if not self._ema_state:
+            return False
+        current_state = self.edm.state_dict()
+        ema_state = {
+            name: value.to(device=current_state[name].device, dtype=current_state[name].dtype)
+            for name, value in self._ema_state.items()
+            if name in current_state and value.shape == current_state[name].shape
+        }
+        if not ema_state:
+            return False
+        self.edm.load_state_dict(ema_state, strict=False)
+        return True
+
+    def on_train_start(self):
+        if self.ema_decay <= 0.0:
+            return
+        current_state = self.edm.state_dict()
+        if not self._ema_state:
+            self._initialize_ema()
+        else:
+            self._ema_state = {
+                name: value.to(device=current_state[name].device, dtype=current_state[name].dtype)
+                for name, value in self._ema_state.items()
+                if name in current_state and value.shape == current_state[name].shape
+            }
+        print(
+            f"EMA enabled: decay={self.ema_decay:.6f}, "
+            f"restored_updates={self._ema_num_updates}"
+        )
+
+    def on_before_zero_grad(self, optimizer):
+        # Lightning calls this after optimizer.step(), so gradient accumulation
+        # produces exactly one EMA update per optimizer update.
+        self._update_ema()
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.ema_decay <= 0.0 or not self._ema_state:
+            return
+        checkpoint['ema_state_dict'] = {
+            name: value.detach().cpu()
+            for name, value in self._ema_state.items()
+        }
+        checkpoint['ema_num_updates'] = int(self._ema_num_updates)
+
+    def on_load_checkpoint(self, checkpoint):
+        ema_state = checkpoint.get('ema_state_dict')
+        if ema_state:
+            self._ema_state = {
+                name: value.detach().clone()
+                for name, value in ema_state.items()
+            }
+            self._ema_num_updates = int(checkpoint.get('ema_num_updates', 0))
+
     def _select_dataset_class(self):
         if self.dataset_name in {'crossdock', 'crossdocked'}:
             if CrossDockDataset is None: raise RuntimeError("CrossDockDataset not found.")
@@ -207,6 +356,9 @@ class DDPM(pl.LightningModule):
             or (CrossDockDataset is not None and dataset_type is CrossDockDataset)
         ):
             kwargs['split'] = split or 'train'
+        if CrossDockDataset is not None and dataset_type is CrossDockDataset:
+            kwargs['split_file'] = self.split_file
+            kwargs['fragment_vocab_path'] = self.fragment_vocab_path
         return dataset_type(**kwargs)
 
     def setup(self, stage: Optional[str] = None):
@@ -326,11 +478,11 @@ class DDPM(pl.LightningModule):
         try:
             bs = data['positions'].shape[0] if 'positions' in data else 0
 
-            
+            # 判断当前是不是需要打印多行详细信息的 Debug 步
             is_debug_step = (self.global_step < 5 or self.global_step % 100 == 0)
 
             # ==============================================================
-            
+            # 1. 打印保留的 DEBUG 块
             # ==============================================================
             if is_debug_step and 'positions' in data:
                 print(f"\n🚀 [Training] Step {self.global_step} ... Batch={bs}")
@@ -341,7 +493,7 @@ class DDPM(pl.LightningModule):
                     print(f"  pocket_frames: {data['pocket_frames'].shape}")
                 print("----------------------------------")
 
-            
+            # 2. 前向传播计算 Loss
             loss, loss_dict = self.forward(data, training=True)
             if not torch.isfinite(loss):
                 bad_metrics = [
@@ -356,7 +508,7 @@ class DDPM(pl.LightningModule):
                 )
 
             # ==============================================================
-            
+            # 3. 终端 Loss 实时输出逻辑
             # ==============================================================
             loss_total = float(loss_dict.get('loss', 0))
             loss_x = float(loss_dict.get('loss_x', 0))
@@ -370,19 +522,27 @@ class DDPM(pl.LightningModule):
             log_str = f"🚀 [Training] Step {self.global_step:05d} ... Batch={bs} | Tot: {loss_total:.3f} | X: {loss_x:.3f} | Rot: {loss_rot:.3f} | Type: {loss_type:.3f} | Bond: {loss_bond:.3f} | GF: {loss_gf:.3f}     "
 
             if is_debug_step:
-                
+                # 如果刚才打印了 Debug 块，直接换行打印 Loss，防止覆盖 Debug 信息
                 print(log_str)
             else:
-                
+                # 平时的普通步，使用 \r 覆盖当前行，实现原地跑马灯效果，终端极其干净！
                 print(f"\r{log_str}", end='', flush=True)
 
-            
-            if self.log_iterations is not None and self.global_step % self.log_iterations == 0:
-                for metric_name, metric in loss_dict.items():
-                    if isinstance(metric, torch.Tensor):
-                        self.log(f'{metric_name}/train', float(metric.detach().cpu()), prog_bar=True)
-                    else:
-                        self.log(f'{metric_name}/train', float(metric), prog_bar=True)
+            # 4. Accumulate every batch so the logged value is the full-epoch mean.
+            # Logging only every ``log_iterations`` steps biases the epoch curve and
+            # makes train/validation comparisons unreliable.
+            for metric_name, metric in loss_dict.items():
+                if not isinstance(metric, torch.Tensor):
+                    metric = torch.tensor(float(metric), device=loss.device)
+                self.log(
+                    f'{metric_name}/train',
+                    metric.detach(),
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=(metric_name == 'loss'),
+                    sync_dist=False,
+                    batch_size=bs,
+                )
 
             return loss
 
@@ -391,13 +551,13 @@ class DDPM(pl.LightningModule):
             return None
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print("\nWarning: CUDA out of memory; clearing the cache and skipping this batch...")
+                print("\n⚠️ 警告：检测到显存不足 (OOM)，正在清空缓存并跳过当前 Batch...")
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
                 return None
             else:
                 import traceback
                 print("\n" + "=" * 50)
-                print("Unhandled RuntimeError:")
+                print("❌ 发现隐藏的 RuntimeError 致命真凶：")
                 traceback.print_exc()
                 print("=" * 50 + "\n")
                 raise e
@@ -405,12 +565,24 @@ class DDPM(pl.LightningModule):
     def validation_step(self, data, *args):
         if data is None: return None
         try:
+            bs = data['positions'].shape[0] if 'positions' in data else 0
             loss, loss_dict = self.forward(data, training=False)
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"Non-finite validation loss at global_step={self.global_step}"
                 )
-            self.log('loss/val', loss.detach(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=False)
+            for metric_name, metric in loss_dict.items():
+                if not isinstance(metric, torch.Tensor):
+                    metric = torch.tensor(float(metric), device=loss.device)
+                self.log(
+                    f'{metric_name}/val',
+                    metric.detach(),
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=(metric_name == 'loss'),
+                    sync_dist=False,
+                    batch_size=bs,
+                )
             return loss_dict
         except FloatingPointError:
             raise
@@ -552,9 +724,9 @@ class DDPM(pl.LightningModule):
                 current_node_atoms =[]
 
                 for atom_info in template:
-                    raw_name = atom_info[0].strip()  
+                    raw_name = atom_info[0].strip()  # ✅ 取第一个元素（名字）
                     elem_symbol = "".join([c for c in raw_name if c.isalpha()])
-                    
+                    # ✅ 修复不完整的语法
                     if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
                         elem_symbol = elem_symbol[0]
                     if elem_symbol == 'H': continue
@@ -590,7 +762,7 @@ class DDPM(pl.LightningModule):
                 Chem.SanitizeMol(final_mol)
                 final_mol = Chem.AddHs(final_mol, addCoords=True)
             except Exception as e:
-                print(f"  Chemical validation failed: {e}; saving the original coordinates.")
+                print(f"  化学检查失败: {e}，将保存原始坐标。")
 
             if save_path:
                 os.makedirs(save_path, exist_ok=True)
@@ -624,7 +796,7 @@ class DDPM(pl.LightningModule):
                 head_parameters.append(parameter)
             else:
                 backbone_parameters.append(parameter)
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             [
                 {"params": backbone_parameters, "lr": self.lr},
                 {
@@ -641,7 +813,71 @@ class DDPM(pl.LightningModule):
                 },
             ],
             amsgrad=True,
-            weight_decay=1e-12,
+            weight_decay=self.weight_decay,
+        )
+        if self.lr_scheduler == 'constant':
+            return optimizer
+
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        if total_steps < 1:
+            raise RuntimeError(
+                f"Cannot build warmup-cosine scheduler with total_steps={total_steps}"
+            )
+        warmup_steps = max(1, int(round(total_steps * self.warmup_fraction)))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda current_step: warmup_cosine_multiplier(
+                current_step=current_step,
+                total_steps=total_steps,
+                warmup_steps=warmup_steps,
+                warmup_start_lr_ratio=self.warmup_start_lr_ratio,
+                min_lr_ratio=self.min_lr_ratio,
+            ),
+        )
+        print(
+            "WarmupCosineLR: "
+            f"total_steps={total_steps}, warmup_steps={warmup_steps} "
+            f"({self.warmup_fraction:.2%}), peak_lr={self.lr:.6g}, "
+            f"start_lr={self.lr * self.warmup_start_lr_ratio:.6g}, "
+            f"min_lr={self.lr * self.min_lr_ratio:.6g}"
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+    def lr_scheduler_step(self, scheduler, optimizer_idx, metric):
+        """Bridge Lightning 1.6.x to the newer PyTorch scheduler API."""
+        if metric is None:
+            scheduler.step()
+        else:
+            scheduler.step(metric)
+
+    def configure_gradient_clipping(
+        self,
+        optimizer,
+        optimizer_idx,
+        gradient_clip_val=None,
+        gradient_clip_algorithm=None,
+    ):
+        """Clip gradients and stop before an update if their norm is non-finite."""
+        parameters = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+        if not parameters:
+            return
+        max_norm = float(gradient_clip_val) if gradient_clip_val is not None else float("inf")
+        torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_norm=max_norm,
+            error_if_nonfinite=True,
         )
 
     def on_train_epoch_start(self):

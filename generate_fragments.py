@@ -1,3 +1,1574 @@
+# # pdb18
+# import argparse
+# import os
+# import numpy as np
+# import torch
+# import copy
+# from scipy.spatial.distance import pdist
+# from rdkit import Chem
+# from rdkit.Chem import rdForceFieldHelpers
+# from rdkit.Chem import QED
+# from rdkit.Chem import Descriptors
+# from tqdm import tqdm
+# import sys
+# from rdkit import RDConfig
+# from rdkit.Chem import AllChem
+# from rdkit.Chem import rdDetermineBonds
+#
+# # 引入合成可及性打分
+# sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
+# try:
+#     from src import sascorer
+# except ImportError:
+#     import sascorer
+#
+# from src import const
+# from src.datasets import collate_with_fragment_edges, get_dataloader, parse_molecule, PDBbindDataset
+# from src.lightning import DDPM
+# from src.utils import FoundNaNException
+# from src.visualizer import save_xyz_file
+#
+# from openfold.np import residue_constants as rc
+# from openfold.utils.rigid_utils import Rotation, Rigid
+# from openfold.utils.tensor_utils import batched_gather
+#
+# parser = argparse.ArgumentParser()
+# parser.add_argument('--model', type=str, required=True)
+# parser.add_argument('--output', type=str, default='./results')
+# parser.add_argument('--n_samples', type=int, default=5)
+# parser.add_argument('--n_steps', type=int, default=None)
+# parser.add_argument('--linker_size', type=str, default='5')
+# parser.add_argument('--use_dataset', action='store_true')
+# parser.add_argument('--data_dir', type=str, default='data')
+# parser.add_argument('--dataset_prefix', type=str, default='PDBbind_pocket10')
+# parser.add_argument('--split_file', type=str, default=None)
+# parser.add_argument('--limit', type=int, default=-1)
+# parser.add_argument('--fragments', type=str, default=None)
+# parser.add_argument('--pocket', type=str, default=None)
+# parser.add_argument('--anchors', type=str, default=None)
+#
+#
+# def force_field_assisted_reconstruction(mol):
+#     """
+#     方案二：通过力场预优化消除扩散位阻应变，随后由官方引擎精确感知拓扑。
+#     """
+#     try:
+#         # 1. 先用最宽松的条件清理一下游离原子
+#         Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+#
+#         # 2. 加氢以准确计算空间位阻
+#         mol_with_h = Chem.AddHs(mol, addCoords=True)
+#
+#         # 3. 极小步数的 UFF 能量最小化（熨平局部畸变，保留整体姿态）
+#         AllChem.UFFOptimizeMolecule(mol_with_h, maxIters=50)
+#
+#         # 4. 移除氢原子
+#         mol_relaxed = Chem.RemoveHs(mol_with_h)
+#     except Exception as e:
+#         # print(f"力场预松弛干预失败，退回原始坐标: {e}")
+#         mol_relaxed = mol
+#
+#     # 5. 坐标平整后，调用官方算法分配单双键和芳香键
+#     try:
+#         rdDetermineBonds.DetermineBondOrders(mol_relaxed, charge=0)
+#         return mol_relaxed
+#     except Exception:
+#         return mol  # 若失败，原样返回，交给后续的 3D 雷达兜底
+#
+#
+# def assemble_via_xyz2mol(atomic_numbers, coords, charge=0):
+#     """
+#     方案三：使用 xyz2mol 的试探性启发式搜索在高度带噪体系中寻取最优的含芳香键重构
+#     (注意：使用此函数前需要在终端执行 pip install xyz2mol)
+#     """
+#     try:
+#         import xyz2mol as x2m
+#         mols = x2m.xyz2mol(atomic_numbers, coords, charge=charge,
+#                            use_graph=True,
+#                            allow_charged_fragments=True,
+#                            use_huckel=True)
+#         if mols:
+#             best_mol = mols[0]
+#             Chem.SanitizeMol(best_mol)
+#             return best_mol
+#     except Exception as e:
+#         print(f"xyz2mol 超启发推演异常: {e}")
+#         pass
+#     return None
+#
+# def enhanced_aromaticity_perception_for_diffusion(mol, coords, ring_indices):
+#     """
+#     为扩散模型定制的强化版三维芳香性感知雷达
+#     """
+#     # 提取目标环的原子三维坐标
+#     ring_coords = coords[list(ring_indices)]
+#
+#     # 利用 SVD 分解计算最小二乘平面并求取 RMSD
+#     centroid = np.mean(ring_coords, axis=0)
+#     centered = ring_coords - centroid
+#     U, S, Vt = np.linalg.svd(centered)
+#     normal = Vt[-1]  # 获取平面的法向量
+#
+#     distances = np.dot(centered, normal)
+#     rmsd = np.sqrt(np.mean(distances ** 2))
+#
+#     # 【核心修改点1】：将平面容忍度阈值从 0.05 提升至 0.25，吸收高斯噪声
+#     # 【核心修改点2】：限定探测范围为 5 元或 6 元环
+#     if rmsd < 0.25 and len(ring_indices) in [5, 6]:
+#
+#         valid_sp2_candidates = 0
+#         # 遍历环上的每一个原子，进行辅助拓扑验证
+#         for idx in ring_indices:
+#             atom = mol.GetAtomWithIdx(idx)
+#             # 获取原子的度数（不包含由外部隐式/显式计算推断的氢）
+#             degree = atom.GetDegree()
+#             # 典型的芳香环原子 (如苯中的碳、吡啶中的氮)，在分子图骨架中度数常为 2 或 3
+#             if degree in [2, 3]:
+#                 valid_sp2_candidates += 1
+#
+#         # 若环内有高达 80% 的原子满足几何与杂化特征的潜力，认定其为扩散生成的芳香环
+#         if valid_sp2_candidates / len(ring_indices) >= 0.8:
+#             for i in range(len(ring_indices)):
+#                 u_idx = ring_indices[i]
+#                 v_idx = ring_indices[(i + 1) % len(ring_indices)]
+#                 bond = mol.GetBondBetweenAtoms(u_idx, v_idx)
+#                 if bond:
+#                     # 显式重写键级为芳香键
+#                     bond.SetBondType(Chem.rdchem.BondType.AROMATIC)
+#                 mol.GetAtomWithIdx(u_idx).SetIsAromatic(True)
+#             return True
+#
+#     return False
+#
+# def svdd_qed_guidance(x_t, t, base_prediction, data, decoder, node_mask, num_samples=15, scale=3.5):
+#     """
+#     终极多目标 SVDD 引导机制：
+#     1. 【加大探索】：num_samples 提升至 15，scale 提升至 3.5，增强在严苛条件下的寻优能力。
+#     2. 【黄金漏斗】：LogP不仅在边缘有高压电网，在 [1.0, 3.0] 内部也有指向 2.0 的“磁吸奖励”。
+#     3. 【权重重组】：大幅拉升 QED 的奖励（* 25.0）和 SA 的惩罚（* 2.0）。
+#     """
+#     device = x_t.device
+#     B = x_t.shape[0]
+#     guided_prediction = base_prediction.clone()
+#
+#     if isinstance(t, torch.Tensor):
+#         t_val = t[0].item() if t.numel() > 1 else t.item()
+#     else:
+#         t_val = t
+#
+#     # 放宽作用时间范围，使得在去噪的中后半段能够持续进行微调
+#     if t_val < 80:
+#         with torch.no_grad():
+#             for b in range(B):
+#                 best_eps = base_prediction[b]
+#                 best_score = -10000.0  # 扩大下限以适应严厉的惩罚
+#                 mask = node_mask[b].bool().cpu().view(-1)
+#
+#                 if not mask.any(): continue
+#
+#                 # 增加单次SVDD的采样量，扩大在陡峭梯度面的搜索范围
+#                 for _ in range(num_samples):
+#                     cand_eps = base_prediction[b] + torch.randn_like(base_prediction[b]) * 0.08
+#                     cand_pos = (x_t[b] - cand_eps)[mask].detach().cpu().numpy()
+#
+#                     if 'one_hot' in data:
+#                         probs = torch.softmax(data['one_hot'][b][mask] / 0.5, dim=-1)
+#                         b_type_idx = torch.multinomial(probs, num_samples=1).squeeze(-1).cpu().numpy()
+#                     else:
+#                         b_type_idx = np.zeros(len(cand_pos), dtype=np.int64)
+#
+#                     try:
+#                         rw_mol = Chem.RWMol()
+#                         valid_coords = []
+#                         for i in range(len(cand_pos)):
+#                             template = decoder.ideal_coords[b_type_idx[i]]
+#                             atom_info = template[0][0]
+#                             elem_symbol = "".join([c for c in atom_info.strip() if c.isalpha()]).capitalize()
+#                             if elem_symbol == 'H': continue
+#                             rw_mol.AddAtom(Chem.Atom(elem_symbol))
+#                             valid_coords.append(cand_pos[i])
+#
+#                         num_atoms = rw_mol.GetNumAtoms()
+#                         for idx_i in range(num_atoms):
+#                             for idx_j in range(idx_i + 1, num_atoms):
+#                                 dist = np.linalg.norm(valid_coords[idx_i] - valid_coords[idx_j])
+#                                 if 0.4 < dist < 1.75:
+#                                     rw_mol.AddBond(idx_i, idx_j, Chem.rdchem.BondType.SINGLE)
+#
+#                         mol = rw_mol.GetMol()
+#                         Chem.SanitizeMol(mol,
+#                                          sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+#
+#                         c_qed = QED.qed(mol)
+#                         c_sa = sascorer.calculateScore(mol)
+#                         c_logp = Descriptors.MolLogP(mol)
+#
+#                         # =========================================================
+#                         # 🌟 核心优化：LogP 黄金漏斗势阱 + QED/SA 强力权重重组
+#                         # =========================================================
+#                         logp_score = 0.0
+#                         if 1.0 <= c_logp <= 3.0:
+#                             # 【磁吸效应】：在安全区内，LogP 越靠近完美的 2.0，给的附加奖励越高！
+#                             # 避免模型在 1~3 之间“躺平”，主动去配合 QED 的提升。
+#                             logp_score = 5.0 - ((c_logp - 2.0) ** 2) * 5.0
+#                         elif c_logp < 1.0:
+#                             # 【高压电网】：一旦越界，线性 + 二次方双重暴击扣分！
+#                             diff = 1.0 - c_logp
+#                             logp_score = -(diff * 30.0 + (diff ** 2) * 50.0)
+#                         else:
+#                             diff = c_logp - 3.0
+#                             logp_score = -(diff * 30.0 + (diff ** 2) * 50.0)
+#
+#                         # 💥 综合打分大洗牌：
+#                         # QED 权重拉爆到 25.0 (满分极高诱惑)
+#                         # SA  惩罚拉到 2.0 (SA 越低，扣分越少，逼迫模型走向易合成结构)
+#                         cand_score = (c_qed * 25.0) - (c_sa * 2.0) + logp_score
+#
+#                     except Exception:
+#                         cand_score = -10000.0
+#
+#                     if cand_score > best_score:
+#                         best_score = cand_score
+#                         best_eps = cand_eps
+#
+#                 if best_score > -10000.0:
+#                     guided_prediction[b] = base_prediction[b] + scale * (best_eps - base_prediction[b])
+#
+#     return guided_prediction
+#
+#
+# class RigidAssemblyDecoder:
+#     def __init__(self):
+#         self.num2aa = const.NUM2AA
+#         self.ideal_coords = const.IDEAL_COORDS
+#         self.aa_bonds = const.AA_BONDS
+#         self.frag_bond_cache = {}  # 缓存片段的真实化学键类型
+#
+#     def get_template_bond_type(self, f_type, start_name, end_name):
+#         """
+#         🌟 智能芳香环检测：结合 3D 平面度分析，合适的位置给芳香键，不合适的给单键！
+#         """
+#         if f_type not in self.frag_bond_cache:
+#             try:
+#                 from rdkit.Chem import rdDetermineBonds
+#                 import numpy as np  # 引入 numpy 计算平面度
+#
+#                 temp_mol = Chem.RWMol()
+#                 idx_map = {}
+#                 coords = []
+#
+#                 for i, atom_info in enumerate(self.ideal_coords[f_type]):
+#                     raw_name = atom_info[0].strip()
+#                     elem_symbol = "".join([c for c in raw_name if c.isalpha()])
+#                     if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
+#                         elem_symbol = elem_symbol[0]
+#                     idx = temp_mol.AddAtom(Chem.Atom(elem_symbol.capitalize()))
+#                     idx_map[raw_name] = idx
+#                     coords.append(atom_info[2])
+#
+#                 conf = Chem.Conformer(temp_mol.GetNumAtoms())
+#                 for i, c in enumerate(coords):
+#                     conf.SetAtomPosition(i, np.array(c).astype(float))
+#                 temp_mol.AddConformer(conf)
+#                 mol = temp_mol.GetMol()
+#
+#                 try:
+#                     rdDetermineBonds.DetermineConnectivity(mol)
+#                 except Exception:
+#                     pass
+#
+#                 determined_officially = False
+#                 try:
+#                     # 尝试官方连双键
+#                     rdDetermineBonds.DetermineBondOrders(mol, charge=0)
+#                     determined_officially = True
+#                 except Exception:
+#                     # 官方失败时，先用单键兜底
+#                     Chem.SanitizeMol(mol,
+#                                      sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+#
+#                # 核心：调用强化版 3D 几何与杂化感知雷达
+#
+#                 conf = mol.GetConformer()
+#                 all_coords = np.array([list(conf.GetAtomPosition(idx)) for idx in range(mol.GetNumAtoms())])
+#
+#                 for ring in mol.GetRingInfo().AtomRings():
+#                     enhanced_aromaticity_perception_for_diffusion(mol, all_coords, ring)
+#
+#                 b_dict = {}
+#                 for bond in mol.GetBonds():
+#                     idx1, idx2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+#                     n1_list = [k for k, v in idx_map.items() if v == idx1]
+#                     n2_list = [k for k, v in idx_map.items() if v == idx2]
+#                     if n1_list and n2_list:
+#                         b_dict[tuple(sorted((n1_list[0], n2_list[0])))] = bond.GetBondType()
+#                 self.frag_bond_cache[f_type] = b_dict
+#             except Exception:
+#                 self.frag_bond_cache[f_type] = {}
+#
+#         pair = tuple(sorted((start_name.strip(), end_name.strip())))
+#         return self.frag_bond_cache[f_type].get(pair, Chem.rdchem.BondType.SINGLE)
+#
+#     def assemble(self, frag_pos, frag_rot, frag_types, node_mask):
+#         batch_mols =[]
+#         B = frag_pos.shape[0]
+#
+#         for b in range(B):
+#             mask = node_mask[b].bool().cpu().view(-1)
+#             b_pos = frag_pos[b][mask].detach().cpu().numpy()
+#             b_rot = frag_rot[b][mask].detach().cpu().numpy()
+#             temp = 0.25
+#             probs = torch.softmax(frag_types[b][mask] / temp, dim=-1)
+#
+#             best_score = -10000.0
+#             best_mol_candidate = None
+#             best_coords_candidate = None
+#
+#             # 🌟 核心调优：增加抽卡次数至 20 次，确保能在严格的 LogP 限制下筛出极品
+#             for attempt in range(20):
+#                 b_type_idx = torch.multinomial(probs, num_samples=1).squeeze(-1).cpu().numpy()
+#
+#                 rw_mol = Chem.RWMol()
+#                 all_final_coords =[]
+#                 centers =[]
+#                 atom_to_frag = {}
+#
+#                 for i in range(len(b_pos)):
+#                     f_type = b_type_idx[i]
+#                     t = b_pos[i].copy()
+#                     R_raw = b_rot[i]
+#
+#                     # 宏观碰撞排斥
+#                     max_relax_iters = 10
+#                     for _ in range(max_relax_iters):
+#                         collision_found = False
+#                         for prev_t in centers:
+#                             dist = np.linalg.norm(t - prev_t)
+#                             if dist < 3.8:
+#                                 collision_found = True
+#                                 direction = t - prev_t
+#                                 norm_dir = np.linalg.norm(direction)
+#                                 if norm_dir < 1e-4: direction = np.random.randn(3)
+#                                 norm_dir = np.linalg.norm(direction)
+#                                 direction = direction / norm_dir
+#                                 # 加入 0.5 的阻尼系数，慢慢推，防止剧烈震荡
+#                                 t += direction * (4.0 - dist) * 0.5
+#                         if not collision_found:
+#                             break  # 如果大家隔得都挺远，安全退出
+#                     centers.append(t.copy())
+#
+#                     try:
+#                         U, _, Vt = np.linalg.svd(R_raw)
+#                         R = np.dot(U, Vt)
+#                         if np.linalg.det(R) < 0:
+#                             Vt[-1, :] *= -1
+#                             R = np.dot(U, Vt)
+#                     except:
+#                         R = np.eye(3)
+#
+#                     template = self.ideal_coords[f_type]
+#                     f_bonds = self.aa_bonds[f_type]
+#                     local_atom_map = {}
+#
+#                     for atom_info in template:
+#                         raw_name = atom_info[0].strip()
+#                         elem_symbol = "".join([c for c in raw_name if c.isalpha()])
+#                         if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
+#                             elem_symbol = elem_symbol[0]
+#                         if elem_symbol.upper() == 'H': continue
+#
+#                         local_pos = np.array(atom_info[2])
+#                         global_pos = np.dot(R, local_pos) + t
+#
+#                         try:
+#                             rd_idx = rw_mol.AddAtom(Chem.Atom(elem_symbol.capitalize()))
+#                             all_final_coords.append(global_pos)
+#                             local_atom_map[raw_name] = rd_idx
+#                             atom_to_frag[rd_idx] = i
+#                         except:
+#                             continue
+#
+#                     for start_name, end_name in f_bonds:
+#                         u = local_atom_map.get(start_name.strip())
+#                         v = local_atom_map.get(end_name.strip())
+#                         if u is not None and v is not None:
+#                             if not rw_mol.GetBondBetweenAtoms(u, v):
+#                                 correct_bond_type = self.get_template_bond_type(f_type, start_name, end_name)
+#                                 rw_mol.AddBond(u, v, correct_bond_type)
+#
+#                                 # 🌟 核心绝杀1：强制印刻原子的芳香性标签，对抗RDKit的三维歧视
+#                                 if correct_bond_type == Chem.rdchem.BondType.AROMATIC:
+#                                     rw_mol.GetAtomWithIdx(u).SetIsAromatic(True)
+#                                     rw_mol.GetAtomWithIdx(v).SetIsAromatic(True)
+#
+#                 if rw_mol.GetNumAtoms() == 0: continue
+#
+#                 final_mol = rw_mol.GetMol()
+#                 conf = Chem.Conformer(final_mol.GetNumAtoms())
+#                 for idx, coord in enumerate(all_final_coords):
+#                     conf.SetAtomPosition(idx, coord.astype(float))
+#                 final_mol.AddConformer(conf)
+#                 fallback_mol = Chem.Mol(final_mol)
+#
+#                 rw_mol_constrained = Chem.RWMol(fallback_mol)
+#                 num_atoms = rw_mol_constrained.GetNumAtoms()
+#                 max_valence = {'C': 4, 'N': 3, 'O': 2, 'S': 6, 'P': 5, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
+#
+#                 connected_frags = set()
+#                 frag_connection_count = {}
+#
+#                 # 片段之间的拼接
+#                 for idx_i in range(num_atoms):
+#                     for idx_j in range(idx_i + 1, num_atoms):
+#                         if not rw_mol_constrained.GetBondBetweenAtoms(idx_i, idx_j):
+#                             p1 = np.array(conf.GetAtomPosition(idx_i))
+#                             p2 = np.array(conf.GetAtomPosition(idx_j))
+#                             dist = np.linalg.norm(p1 - p2)
+#
+#                             if 0.4 < dist < 1.65:
+#                                 frag_i = atom_to_frag.get(idx_i, -1)
+#                                 frag_j = atom_to_frag.get(idx_j, -2)
+#
+#                                 if frag_i != frag_j:
+#                                     pair = tuple(sorted((frag_i, frag_j)))
+#                                     if pair in connected_frags: continue
+#
+#                                     MAX_FRAG_DEGREE = 2
+#                                     if frag_connection_count.get(frag_i, 0) >= MAX_FRAG_DEGREE or \
+#                                             frag_connection_count.get(frag_j, 0) >= MAX_FRAG_DEGREE:
+#                                         continue
+#
+#                                 atom_i = rw_mol_constrained.GetAtomWithIdx(idx_i)
+#                                 atom_j = rw_mol_constrained.GetAtomWithIdx(idx_j)
+#                                 limit_i = max_valence.get(atom_i.GetSymbol(), 4)
+#                                 limit_j = max_valence.get(atom_j.GetSymbol(), 4)
+#
+#                                 if atom_i.GetDegree() < limit_i and atom_j.GetDegree() < limit_j:
+#                                     rw_mol_constrained.AddBond(idx_i, idx_j, Chem.rdchem.BondType.SINGLE)
+#
+#                                     if frag_i != frag_j:
+#                                         connected_frags.add(pair)
+#                                         frag_connection_count[frag_i] = frag_connection_count.get(frag_i, 0) + 1
+#                                         frag_connection_count[frag_j] = frag_connection_count.get(frag_j, 0) + 1
+#                 if len(all_final_coords) > 1:
+#                     from scipy.spatial.distance import pdist
+#                     distances = pdist(np.array(all_final_coords))
+#                     # 如果任意两个原子距离小于 0.45 埃，说明发生了极其严重的物理重叠
+#                     if np.min(distances) < 0.45:
+#                         continue  # 直接抛弃这个废品，进入下一个 attempt，绝不送给 RDKit 折磨它！
+#                 try:
+#                     raw_mol = rw_mol_constrained.GetMol()
+#                     # 让 UFF 力场先轻微活动一下扭曲的原子，然后自动推断芳香键
+#                     final_mol = force_field_assisted_reconstruction(raw_mol)
+#
+#                     # 彻底进行标准化学检查，因为键级已经被正确分配了
+#                     Chem.SanitizeMol(final_mol)
+#                 except:
+#                     # 如果方案二崩溃，尝试调用方案三 (xyz2mol) 作为终极兜底
+#                     try:
+#                         atoms_list = [atom.GetAtomicNum() for atom in raw_mol.GetAtoms()]
+#                         coords_list = [list(conf.GetAtomPosition(i)) for i in range(raw_mol.GetNumAtoms())]
+#                         fallback_mol = assemble_via_xyz2mol(atoms_list, coords_list)
+#                         if fallback_mol is not None:
+#                             final_mol = fallback_mol
+#                         else:
+#                             continue
+#                     except:
+#                         continue
+#
+#                 try:
+#                     frags = Chem.GetMolFrags(final_mol, asMols=True)
+#                     if not frags: continue
+#                     largest_frag = max(frags, key=lambda m: m.GetNumAtoms())
+#                     if largest_frag.GetNumAtoms() < 5: continue
+#                 except:
+#                     continue
+#
+#                 # =========================================================
+#                 # 绝杀3：基于重构特征的多目标打分（LogP平底锅 + 芳香环奖励）
+#                 # =========================================================
+#                 try:
+#                     c_qed = QED.qed(largest_frag)
+#                     c_sa = sascorer.calculateScore(largest_frag)
+#                     c_logp = Descriptors.MolLogP(largest_frag)
+#
+#                     # 执行极高梯度的 LogP 二次惩罚
+#                     if 1.0 <= c_logp <= 3.0:
+#                         logp_penalty = 0.0
+#                     elif c_logp < 1.0:
+#                         logp_penalty = ((1.0 - c_logp) ** 2) * 15.0
+#                     else:
+#                         logp_penalty = ((c_logp - 3.0) ** 2) * 15.0
+#
+#                     ring_info = largest_frag.GetRingInfo()
+#                     atom_rings = ring_info.AtomRings()
+#
+#                     good_rings = 0
+#                     bad_rings = 0
+#                     aromatic_rings = 0
+#
+#                     for ring in atom_rings:
+#                         if len(ring) in [5, 6]:
+#                             good_rings += 1
+#                         else:
+#                             bad_rings += 1
+#                         # 现在原子被标记了芳香性，这里的判定将能准确找到生成的芳香环
+#                         if all(largest_frag.GetAtomWithIdx(idx).GetIsAromatic() for idx in ring):
+#                             aromatic_rings += 1
+#
+#                     cand_score = (c_qed * 15.0) - c_sa - logp_penalty
+#                     # 加大对于优质芳香拓扑特征的奖赏，强行引导模型选出带芳香体系的构象
+#                     cand_score += (aromatic_rings * 5.0) + (good_rings * 2.0) - (bad_rings * 4.0)
+#
+#                     if cand_score > best_score:
+#                         best_score = cand_score
+#                         best_mol_candidate = largest_frag
+#
+#                         conf_new = best_mol_candidate.GetConformer()
+#                         best_coords_candidate = [conf_new.GetAtomPosition(i) for i in
+#                                                  range(best_mol_candidate.GetNumAtoms())]
+#                 except:
+#                     continue
+#
+#             # ====================== 重采样结束 ======================
+#             if best_mol_candidate is None:
+#                 batch_mols.append((None, None))
+#                 continue
+#
+#             # 🌟 绝杀4：力场-芳香共振机制 (Force Field Resonance)
+#             # 我们通过代码预先写死了芳香拓扑，现在召唤 MMFF94 力场。
+#             # 力场会读取这些键的理想键长与键角，以雷霆万钧之势把扩散模型生成的扭曲 3D 坐标
+#             # 暴力压平，还原出一个完美的平面芳香环三维坐标！
+#             try:
+#                 # 此时由于构象将被MMFF强行校正，我们可以安全地执行完全Sanitize
+#                 Chem.SanitizeMol(best_mol_candidate)
+#                 rdForceFieldHelpers.MMFFOptimizeMolecule(best_mol_candidate, maxIters=1000, nonBondedThresh=100.0)
+#             except:
+#                 pass
+#
+#             try:
+#                 conf_new = best_mol_candidate.GetConformer()
+#                 final_coords_cleaned = [conf_new.GetAtomPosition(i) for i in range(best_mol_candidate.GetNumAtoms())]
+#             except:
+#                 final_coords_cleaned = best_coords_candidate
+#
+#             batch_mols.append((best_mol_candidate, final_coords_cleaned))
+#
+#         return batch_mols
+#
+#
+# # =========================================================================
+# # 后续的数据处理和运行逻辑保持不变
+# # =========================================================================
+# def _ensure_3d_mask(m: torch.Tensor, B: int, N: int, device, default_val: float = 1.0):
+#     if m is None: return torch.full((B, N, 1), float(default_val), device=device)
+#     if not isinstance(m, torch.Tensor): m = torch.tensor(m, dtype=torch.float32, device=device)
+#     if m.dim() == 1:
+#         m = m.view(1, -1, 1).repeat(B, 1, 1)
+#     elif m.dim() == 2:
+#         m = m.unsqueeze(-1)
+#     elif m.dim() == 3:
+#         m = m[:, :, :1]
+#     return m.float().to(device)
+#
+#
+# def _xyz_only(pos: torch.Tensor):
+#     if pos.dim() == 2: pos = pos.unsqueeze(0)
+#     if pos.size(-1) >= 3: return pos[..., :3].contiguous()
+#     raise RuntimeError(f"Position tensor last dim must be >= 3, got {pos.shape}")
+#
+#
+# def read_molecule(path):
+#     mol = None
+#     if path.endswith('.pdb'):
+#         mol = Chem.MolFromPDBFile(path, sanitize=False, removeHs=True)
+#     elif path.endswith('.mol') or path.endswith('.mol2'):
+#         mol = Chem.MolFromMolFile(path, sanitize=False, removeHs=True)
+#     elif path.endswith('.sdf'):
+#         suppl = Chem.SDMolSupplier(path, sanitize=False, removeHs=True)
+#         mol = suppl[0] if len(suppl) > 0 else None
+#     if mol is None: raise ValueError(f"Failed to read molecule from {path}")
+#     return mol
+#
+#
+# def bridge_rdkit_to_openfold_tensor(mol, device='cpu'):
+#     residues = list(mol.GetResidues())
+#     n_res = len(residues)
+#     all_atom_positions = np.zeros((n_res, 37, 3))
+#     all_atom_mask = np.zeros((n_res, 37))
+#     aatype = np.zeros(n_res, dtype=np.int64)
+#     for i, res in enumerate(residues):
+#         res_name = res.GetResidueName().strip()
+#         aatype[i] = rc.restype_order.get(rc.restype_3to1.get(res_name, 'X'), 20)
+#         for atom in res.GetAtoms():
+#             p_info = atom.GetPDBResidueInfo()
+#             if p_info is None: continue
+#             atom_name = p_info.GetName().strip()
+#             if atom_name in rc.atom_order:
+#                 idx = rc.atom_order[atom_name]
+#                 pos = mol.GetConformer().GetAtomPosition(atom.GetIdx())
+#                 all_atom_positions[i, idx] = [pos.x, pos.y, pos.z]
+#                 all_atom_mask[i, idx] = 1.0
+#     return {
+#         "aatype": torch.tensor(aatype, device=device),
+#         "all_atom_positions": torch.tensor(all_atom_positions, dtype=torch.float32, device=device),
+#         "all_atom_mask": torch.tensor(all_atom_mask, dtype=torch.float32, device=device)
+#     }
+#
+#
+# def atom37_to_frames(protein, eps=1e-8):
+#     aatype = protein["aatype"]
+#     all_atom_positions = protein["all_atom_positions"]
+#     all_atom_mask = protein["all_atom_mask"]
+#     batch_dims = len(aatype.shape[:-1])
+#
+#     restype_rigidgroup_base_atom_names = np.full([21, 8, 3], "", dtype=object)
+#     restype_rigidgroup_base_atom_names[:, 0, :] = ["C", "CA", "N"]
+#     restype_rigidgroup_base_atom_names[:, 3, :] = ["CA", "C", "O"]
+#
+#     for restype, restype_letter in enumerate(rc.restypes):
+#         resname = rc.restype_1to3[restype_letter]
+#         for chi_idx in range(4):
+#             if rc.chi_angles_mask[restype][chi_idx]:
+#                 names = rc.chi_angles_atoms[resname][chi_idx]
+#                 restype_rigidgroup_base_atom_names[restype, chi_idx + 4, :] = names[1:]
+#
+#     restype_rigidgroup_mask = all_atom_mask.new_zeros((*aatype.shape[:-1], 21, 8))
+#     restype_rigidgroup_mask[..., 0] = 1
+#     restype_rigidgroup_mask[..., 3] = 1
+#     restype_rigidgroup_mask[..., :20, 4:] = all_atom_mask.new_tensor(rc.chi_angles_mask)
+#
+#     lookuptable = rc.atom_order.copy()
+#     lookuptable[""] = 0
+#     lookup = np.vectorize(lambda x: lookuptable[x])
+#     restype_rigidgroup_base_atom37_idx = lookup(restype_rigidgroup_base_atom_names)
+#     restype_rigidgroup_base_atom37_idx = aatype.new_tensor(restype_rigidgroup_base_atom37_idx)
+#     restype_rigidgroup_base_atom37_idx = restype_rigidgroup_base_atom37_idx.view(*((1,) * batch_dims),
+#                                                                                  *restype_rigidgroup_base_atom37_idx.shape)
+#
+#     residx_rigidgroup_base_atom37_idx = batched_gather(restype_rigidgroup_base_atom37_idx, aatype, dim=-3,
+#                                                        no_batch_dims=batch_dims)
+#     base_atom_pos = batched_gather(all_atom_positions, residx_rigidgroup_base_atom37_idx, dim=-2,
+#                                    no_batch_dims=len(all_atom_positions.shape[:-2]))
+#
+#     gt_frames = Rigid.from_3_points(p_neg_x_axis=base_atom_pos[..., 0, :], origin=base_atom_pos[..., 1, :],
+#                                     p_xy_plane=base_atom_pos[..., 2, :], eps=eps)
+#
+#     group_exists = batched_gather(restype_rigidgroup_mask, aatype, dim=-2, no_batch_dims=batch_dims)
+#     gt_atoms_exist = batched_gather(all_atom_mask, residx_rigidgroup_base_atom37_idx, dim=-1,
+#                                     no_batch_dims=len(all_atom_mask.shape[:-1]))
+#     gt_exists = torch.min(gt_atoms_exist, dim=-1)[0] * group_exists
+#
+#     rots = torch.eye(3, dtype=all_atom_mask.dtype, device=aatype.device)
+#     rots = torch.tile(rots, (*((1,) * batch_dims), 8, 1, 1))
+#     rots[..., 0, 0, 0] = -1
+#     rots[..., 0, 2, 2] = -1
+#     rots = Rotation(rot_mats=rots)
+#     gt_frames = gt_frames.compose(Rigid(rots, None))
+#
+#     gt_frames_tensor = gt_frames.to_tensor_4x4()
+#     protein["rigidgroups_gt_frames"] = gt_frames_tensor
+#     protein["rigidgroups_gt_exists"] = gt_exists
+#     return protein
+#
+#
+# def main(args):
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     os.makedirs(args.output, exist_ok=True)
+#
+#     print(f"🚀 Loading FragDiff model from {args.model}...")
+#     ddpm = DDPM.load_from_checkpoint(args.model, map_location=device).eval().to(device)
+#     if args.n_steps is not None: ddpm.edm.T = args.n_steps
+#     ddpm.reconstruct_and_save = lambda *args, **kwargs: []
+#
+#     if args.linker_size.isdigit():
+#         fixed_size = int(args.linker_size)
+#
+#         def sample_fn(_data):
+#             return torch.full((_data['positions'].shape[0],), fixed_size, device=device, dtype=const.TORCH_INT)
+#     else:
+#         bounds = [int(x.strip()) for x in args.linker_size.split(',')]
+#         left, right = bounds[0], bounds[1]
+#
+#         def sample_fn(_data):
+#             return torch.randint(left, right + 1, (len(_data['positions']),), device=device, dtype=const.TORCH_INT)
+#
+#     dataset_list = []
+#
+#     if args.use_dataset:
+#         print("📁 Running in DATASET MODE")
+#         split_path = args.split_file or os.path.join(args.data_dir, f"{args.dataset_prefix}_split.pt")
+#         full_dataset = PDBbindDataset(data_path=args.data_dir, prefix=args.dataset_prefix, device=device)
+#         split_data = torch.load(split_path)
+#         test_indices = split_data.get('test', []) or split_data.get('val', [])
+#         if args.limit > 0: test_indices = test_indices[:args.limit]
+#
+#         for idx in tqdm(test_indices, desc="Pre-loading Targets"):
+#             try:
+#                 data_item = full_dataset[idx]
+#                 if 'positions' not in data_item: data_item['positions'] = data_item['ligand_pos']
+#                 if 'one_hot' not in data_item:
+#                     elem_map = {1: 0, 6: 0, 7: 1, 8: 2, 9: 3, 15: 4, 16: 5, 17: 6, 35: 7, 53: 8}
+#                     elements = data_item['ligand_element'].view(-1).tolist()
+#                     one_hot = torch.zeros((len(elements), 9), dtype=torch.float32)
+#                     for i, e in enumerate(elements): one_hot[i, elem_map.get(e, 0)] = 1.0
+#                     data_item['one_hot'] = one_hot
+#                 if 'fragment_mask' not in data_item:
+#                     n_atoms = len(data_item['positions'])
+#                     import random
+#                     n_linker = random.randint(1, 3)
+#                     n_frag = max(1, n_atoms - n_linker)
+#                     frag_mask = torch.zeros(n_atoms, dtype=torch.float32)
+#                     frag_mask[:n_frag] = 1.0
+#                     link_mask = torch.zeros(n_atoms, dtype=torch.float32)
+#                     link_mask[n_frag:] = 1.0
+#                     data_item['fragment_mask'] = frag_mask
+#                     data_item['linker_mask'] = link_mask
+#                 if 'anchors' not in data_item: data_item['anchors'] = torch.zeros(len(data_item['positions']),
+#                                                                                   dtype=torch.float32)
+#                 for _ in range(args.n_samples): dataset_list.append({k: v for k, v in data_item.items()})
+#             except Exception:
+#                 pass
+#     else:
+#         print("🧪 Running in SINGLE FILE MODE")
+#         pocket_mol = read_molecule(args.pocket)
+#         pocket_tensor = bridge_rdkit_to_openfold_tensor(pocket_mol, device=device)
+#         pocket_with_frames = atom37_to_frames(pocket_tensor)
+#         pocket_frames = pocket_with_frames["rigidgroups_gt_frames"][:, 0, :, :]
+#         pocket_mask = pocket_with_frames["rigidgroups_gt_exists"][:, 0]
+#
+#         molecule = read_molecule(args.fragments)
+#         positions, one_hot, charges = parse_molecule(molecule, is_geom=ddpm.is_geom)
+#         n_atoms = len(positions)
+#
+#         anchor_flags = np.zeros(n_atoms)
+#         if args.anchors:
+#             for a in args.anchors.split(','): anchor_flags[int(a.strip()) - 1] = 1
+#
+#         single_data = {
+#             'uuid': '0', 'name': os.path.basename(args.fragments).split('.')[0],
+#             'positions': torch.tensor(positions, dtype=torch.float32, device=device),
+#             'one_hot': torch.tensor(one_hot, dtype=torch.float32, device=device),
+#             'charges': torch.tensor(charges, dtype=torch.float32, device=device),
+#             'anchors': torch.tensor(anchor_flags, dtype=torch.float32, device=device),
+#             'fragment_mask': torch.ones(n_atoms, dtype=torch.float32, device=device),
+#             'linker_mask': torch.zeros(n_atoms, dtype=torch.float32, device=device),
+#             'num_atoms': n_atoms,
+#             'pocket_frames': pocket_frames.to(device),
+#             'pocket_mask': pocket_mask.to(device)
+#         }
+#         dataset_list = [single_data] * args.n_samples
+#
+#     if not dataset_list: return
+#     batch_size = min(len(dataset_list), 16)
+#     dataloader = get_dataloader(dataset_list, batch_size=batch_size, collate_fn=collate_with_fragment_edges)
+#
+#     for batch_i, data in enumerate(tqdm(dataloader, desc="Denoising Samples")):
+#         for k, v in data.items():
+#             if isinstance(v, torch.Tensor): data[k] = v.to(device)
+#
+#         bs, n_nodes = data['positions'].shape[0], data['positions'].shape[1]
+#         curr_node_mask = _ensure_3d_mask(data.get('atom_mask', None), bs, n_nodes, device)
+#         curr_edge_mask = None
+#         curr_context = data.get('context', None)
+#
+#         if 'linker_mask' in data and 'fragment_mask' in data:
+#             real_pos_temp = data['positions'].clone()
+#             linker_mask_3d = _ensure_3d_mask(data['linker_mask'], bs, n_nodes, device)
+#             fragment_mask_3d = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device)
+#
+#             raw_noise = torch.randn_like(real_pos_temp)
+#             sum_pos = (real_pos_temp * fragment_mask_3d).sum(dim=1, keepdim=True)
+#             count_pos = fragment_mask_3d.sum(dim=1, keepdim=True).clamp(min=1.0)
+#             center_of_mass = sum_pos / count_pos
+#             aligned_noise = raw_noise + center_of_mass
+#             data['positions'] = torch.where(linker_mask_3d > 0.5, aligned_noise, real_pos_temp)
+#
+#         sample_results = None
+#         for attempt in range(5):
+#             try:
+#                 decoder_instance = RigidAssemblyDecoder()
+#                 my_guidance_fn = lambda x_t, t, base_pred: svdd_qed_guidance(
+#                     x_t, t, base_pred, data, decoder_instance, curr_node_mask, num_samples=15, scale=3.5
+#                 )
+#                 sample_results = ddpm.sample_chain(data, sample_fn=sample_fn, keep_frames=1, edge_mask=curr_edge_mask,
+#                                                    context=curr_context, save_path=None, guidance_fn=my_guidance_fn)
+#                 break
+#             except FoundNaNException:
+#                 continue
+#             except Exception as e:
+#                 import traceback
+#                 print(f"\n❌ 采样过程发生致命错误: {e}")
+#                 traceback.print_exc()
+#                 break
+#
+#         if sample_results is None: continue
+#
+#         chain_data, node_mask = sample_results
+#         while isinstance(chain_data, (tuple, list)): chain_data = chain_data[0]
+#
+#         if chain_data.dim() == 4:
+#             current_chain = chain_data[-1]
+#         else:
+#             current_chain = chain_data
+#
+#         x_gen = current_chain[..., :3]
+#
+#         if 'fragment_mask' in data:
+#             frag_mask_3d = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device)
+#             real_pos = _xyz_only(data['positions'])
+#             x_gen = torch.where(frag_mask_3d > 0.5, real_pos, x_gen)
+#
+#         final_x = x_gen
+#
+#         try:
+#             rot_flat = current_chain[..., 3:12]
+#             rot_gen = rot_flat.view(bs, n_nodes, 3, 3)
+#
+#             if 'frag_rotations' in data and 'fragment_mask' in data:
+#                 frag_mask_3d_rot = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device).unsqueeze(-1)
+#                 real_rot = data['frag_rotations']
+#                 rot_gen = torch.where(frag_mask_3d_rot > 0.5, real_rot, rot_gen)
+#
+#             raw_h_gen = current_chain[..., 12:]
+#             frag_types_gen = raw_h_gen[..., :len(const.NUM2AA)]
+#
+#             decoder = RigidAssemblyDecoder()
+#             mols_and_coords = decoder.assemble(final_x, rot_gen, frag_types_gen, node_mask)
+#
+#             raw_names = data.get('name', [f"target_{batch_i}" for _ in range(bs)])
+#             if isinstance(raw_names, str): raw_names = [raw_names] * bs
+#
+#             for j, (mol, coords) in enumerate(mols_and_coords):
+#                 if mol is None or coords is None: continue
+#                 target_name = raw_names[j]
+#                 sample_idx = batch_i * batch_size + j
+#                 sdf_path = os.path.join(args.output, f"{target_name}_sample_{sample_idx}.sdf")
+#
+#                 final_mol = Chem.Mol(mol)
+#                 try:
+#                     conf = Chem.Conformer(final_mol.GetNumAtoms())
+#                     for idx, coord in enumerate(coords):
+#                         conf.SetAtomPosition(idx, np.array(coord, dtype=np.float64))
+#                     final_mol.RemoveAllConformers()
+#                     final_mol.AddConformer(conf)
+#                     Chem.Kekulize(final_mol, clearAromaticFlags=True)
+#                 except Exception as e:
+#                     pass
+#
+#
+#                 writer = Chem.SDWriter(sdf_path)
+#                 writer.SetKekulize(False)
+#                 writer.write(final_mol)
+#                 writer.close()
+#
+#         except Exception as e:
+#             print(f"❌ Batch {batch_i} 组装/保存过程发生错误: {e}")
+#
+#
+# if __name__ == '__main__':
+#     args = parser.parse_args()
+#     main(args)
+#pdb 16
+# import argparse
+# import os
+# import numpy as np
+# import torch
+# import copy
+# from rdkit import Chem
+# from rdkit.Chem import rdForceFieldHelpers
+# from rdkit.Chem import QED
+# from rdkit.Chem import Descriptors
+# from tqdm import tqdm
+# import sys
+# from rdkit import RDConfig
+#
+# # 引入合成可及性打分
+# sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
+# try:
+#     from src import sascorer
+# except ImportError:
+#     import sascorer
+#
+# from src import const
+# from src.datasets import collate_with_fragment_edges, get_dataloader, parse_molecule, PDBbindDataset
+# from src.lightning import DDPM
+# from src.utils import FoundNaNException
+# from src.visualizer import save_xyz_file
+#
+# from openfold.np import residue_constants as rc
+# from openfold.utils.rigid_utils import Rotation, Rigid
+# from openfold.utils.tensor_utils import batched_gather
+#
+# parser = argparse.ArgumentParser()
+# parser.add_argument('--model', type=str, required=True)
+# parser.add_argument('--output', type=str, default='./results')
+# parser.add_argument('--n_samples', type=int, default=5)
+# parser.add_argument('--n_steps', type=int, default=None)
+# parser.add_argument('--linker_size', type=str, default='5')
+# parser.add_argument('--use_dataset', action='store_true')
+# parser.add_argument('--data_dir', type=str, default='data')
+# parser.add_argument('--dataset_prefix', type=str, default='PDBbind_pocket10')
+# parser.add_argument('--split_file', type=str, default=None)
+# parser.add_argument('--limit', type=int, default=-1)
+# parser.add_argument('--fragments', type=str, default=None)
+# parser.add_argument('--pocket', type=str, default=None)
+# parser.add_argument('--anchors', type=str, default=None)
+#
+#
+# def svdd_qed_guidance(x_t, t, base_prediction, data, decoder, node_mask, num_samples=3, scale=1.5):
+#     """
+#     多目标优化版 SVDD 引导：优化 QED，惩罚 SA Score，并将 LogP 锁定在 [1.0, 3.0] 黄金区间。
+#     """
+#     device = x_t.device
+#     B = x_t.shape[0]
+#     guided_prediction = base_prediction.clone()
+#
+#     if isinstance(t, torch.Tensor):
+#         t_val = t[0].item() if t.numel() > 1 else t.item()
+#     else:
+#         t_val = t
+#
+#     if t_val < 20:
+#         with torch.no_grad():
+#             for b in range(B):
+#                 best_eps = base_prediction[b]
+#                 best_score = -100.0
+#                 mask = node_mask[b].bool().cpu().view(-1)
+#
+#                 if not mask.any(): continue
+#
+#                 for _ in range(num_samples):
+#                     cand_eps = base_prediction[b] + torch.randn_like(base_prediction[b]) * 0.05
+#                     cand_pos = (x_t[b] - cand_eps)[mask].detach().cpu().numpy()
+#
+#                     if 'one_hot' in data:
+#                         probs = torch.softmax(data['one_hot'][b][mask] / 0.5, dim=-1)
+#                         b_type_idx = torch.multinomial(probs, num_samples=1).squeeze(-1).cpu().numpy()
+#                     else:
+#                         b_type_idx = np.zeros(len(cand_pos), dtype=np.int64)
+#
+#                     try:
+#                         rw_mol = Chem.RWMol()
+#                         valid_coords = []
+#                         for i in range(len(cand_pos)):
+#                             template = decoder.ideal_coords[b_type_idx[i]]
+#                             atom_info = template[0][0]
+#                             elem_symbol = "".join([c for c in atom_info.strip() if c.isalpha()]).capitalize()
+#                             if elem_symbol == 'H': continue
+#                             rw_mol.AddAtom(Chem.Atom(elem_symbol))
+#                             valid_coords.append(cand_pos[i])
+#
+#                         num_atoms = rw_mol.GetNumAtoms()
+#                         for idx_i in range(num_atoms):
+#                             for idx_j in range(idx_i + 1, num_atoms):
+#                                 dist = np.linalg.norm(valid_coords[idx_i] - valid_coords[idx_j])
+#                                 if 1.0 < dist < 4.0:
+#                                     rw_mol.AddBond(idx_i, idx_j, Chem.rdchem.BondType.SINGLE)
+#
+#                         mol = rw_mol.GetMol()
+#                         Chem.SanitizeMol(mol)
+#
+#                         c_qed = QED.qed(mol)
+#                         c_sa = sascorer.calculateScore(mol)
+#                         c_logp = Descriptors.MolLogP(mol)
+#
+#                         # 🌟 平底锅 LogP 惩罚：严格锁定在 1.0 ~ 3.0 之间
+#                         if 1.0 <= c_logp <= 3.0:
+#                             logp_penalty = 0.0
+#                         elif c_logp < 1.0:
+#                             logp_penalty = (1.0 - c_logp) * 4.0
+#                         else:
+#                             logp_penalty = (c_logp - 3.0) * 4.0
+#
+#                         cand_score = (c_qed * 10.0) - c_sa - logp_penalty
+#                     except Exception:
+#                         cand_score = -100.0
+#
+#                     if cand_score > best_score:
+#                         best_score = cand_score
+#                         best_eps = cand_eps
+#
+#                 if best_score > -100.0:
+#                     guided_prediction[b] = base_prediction[b] + scale * (best_eps - base_prediction[b])
+#
+#     return guided_prediction
+#
+#
+# class RigidAssemblyDecoder:
+#     def __init__(self):
+#         self.num2aa = const.NUM2AA
+#         self.ideal_coords = const.IDEAL_COORDS
+#         self.aa_bonds = const.AA_BONDS
+#         self.frag_bond_cache = {}  # 缓存片段的真实化学键类型
+#
+#     def get_template_bond_type(self, f_type, start_name, end_name):
+#         """
+#         🌟 核心魔法 1：模板基因印刻。
+#         提取极其完美的片段底层键属性，确保苯环等自带真正的“芳香键”！
+#         """
+#         if f_type not in self.frag_bond_cache:
+#             try:
+#                 from rdkit.Chem import rdDetermineBonds
+#                 temp_mol = Chem.RWMol()
+#                 idx_map = {}
+#                 conf = Chem.Conformer(len(self.ideal_coords[f_type]))
+#                 for i, atom_info in enumerate(self.ideal_coords[f_type]):
+#                     raw_name = atom_info[0].strip()
+#                     elem_symbol = "".join([c for c in raw_name if c.isalpha()])
+#                     if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
+#                         elem_symbol = elem_symbol[0]
+#                     # 我们需要H来帮助判断真实价态，不跳过H
+#                     idx = temp_mol.AddAtom(Chem.Atom(elem_symbol.capitalize()))
+#                     idx_map[raw_name] = idx
+#                     conf.SetAtomPosition(idx, np.array(atom_info[2]).astype(float))
+#                 temp_mol.GetMol().AddConformer(conf)
+#
+#                 for st, en in self.aa_bonds[f_type]:
+#                     u = idx_map.get(st.strip())
+#                     v = idx_map.get(en.strip())
+#                     if u is not None and v is not None:
+#                         temp_mol.AddBond(u, v, Chem.rdchem.BondType.SINGLE)
+#
+#                 Chem.SanitizeMol(temp_mol)
+#                 rdDetermineBonds.DetermineBondOrders(temp_mol.GetMol(), charge=0)
+#
+#                 b_dict = {}
+#                 for bond in temp_mol.GetBonds():
+#                     idx1, idx2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+#                     n1 = [k for k, v in idx_map.items() if v == idx1][0]
+#                     n2 = [k for k, v in idx_map.items() if v == idx2][0]
+#                     b_dict[tuple(sorted((n1, n2)))] = bond.GetBondType()
+#                 self.frag_bond_cache[f_type] = b_dict
+#             except Exception:
+#                 self.frag_bond_cache[f_type] = {}
+#
+#         pair = tuple(sorted((start_name.strip(), end_name.strip())))
+#         return self.frag_bond_cache[f_type].get(pair, Chem.rdchem.BondType.SINGLE)
+#
+#     def assemble(self, frag_pos, frag_rot, frag_types, node_mask):
+#         batch_mols = []
+#         B = frag_pos.shape[0]
+#
+#         for b in range(B):
+#             mask = node_mask[b].bool().cpu().view(-1)
+#             b_pos = frag_pos[b][mask].detach().cpu().numpy()
+#             b_rot = frag_rot[b][mask].detach().cpu().numpy()
+#             temp = 0.25
+#             probs = torch.softmax(frag_types[b][mask] / temp, dim=-1)
+#
+#             best_score = -1000.0
+#             best_mol_candidate = None
+#             best_coords_candidate = None
+#
+#             # 重采样抽卡 10 次
+#             for attempt in range(10):
+#                 b_type_idx = torch.multinomial(probs, num_samples=1).squeeze(-1).cpu().numpy()
+#
+#                 rw_mol = Chem.RWMol()
+#                 all_final_coords = []
+#                 centers = []
+#                 atom_to_frag = {}
+#
+#                 for i in range(len(b_pos)):
+#                     f_type = b_type_idx[i]
+#                     t = b_pos[i].copy()
+#                     R_raw = b_rot[i]
+#
+#                     # 宏观碰撞排斥
+#                     for prev_t in centers:
+#                         dist = np.linalg.norm(t - prev_t)
+#                         if dist < 3.8:
+#                             direction = t - prev_t
+#                             norm_dir = np.linalg.norm(direction)
+#                             if norm_dir < 1e-4: direction = np.random.randn(3)
+#                             norm_dir = np.linalg.norm(direction)
+#                             direction = direction / norm_dir
+#                             t += direction * (4.0 - dist)
+#                     centers.append(t.copy())
+#
+#                     try:
+#                         U, _, Vt = np.linalg.svd(R_raw)
+#                         R = np.dot(U, Vt)
+#                         if np.linalg.det(R) < 0:
+#                             Vt[-1, :] *= -1
+#                             R = np.dot(U, Vt)
+#                     except:
+#                         R = np.eye(3)
+#
+#                     template = self.ideal_coords[f_type]
+#                     f_bonds = self.aa_bonds[f_type]
+#                     local_atom_map = {}
+#
+#                     for atom_info in template:
+#                         raw_name = atom_info[0].strip()
+#                         elem_symbol = "".join([c for c in raw_name if c.isalpha()])
+#                         if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
+#                             elem_symbol = elem_symbol[0]
+#                         if elem_symbol.upper() == 'H': continue
+#
+#                         local_pos = np.array(atom_info[2])
+#                         global_pos = np.dot(R, local_pos) + t
+#
+#                         try:
+#                             rd_idx = rw_mol.AddAtom(Chem.Atom(elem_symbol.capitalize()))
+#                             all_final_coords.append(global_pos)
+#                             local_atom_map[raw_name] = rd_idx
+#                             atom_to_frag[rd_idx] = i
+#                         except:
+#                             continue
+#
+#                     for start_name, end_name in f_bonds:
+#                         u = local_atom_map.get(start_name.strip())
+#                         v = local_atom_map.get(end_name.strip())
+#                         if u is not None and v is not None:
+#                             if not rw_mol.GetBondBetweenAtoms(u, v):
+#                                 # 🌟 调用核心魔法：直接打上芳香键和双键的烙印！
+#                                 correct_bond_type = self.get_template_bond_type(f_type, start_name, end_name)
+#                                 rw_mol.AddBond(u, v, correct_bond_type)
+#
+#                 if rw_mol.GetNumAtoms() == 0: continue
+#
+#                 final_mol = rw_mol.GetMol()
+#                 conf = Chem.Conformer(final_mol.GetNumAtoms())
+#                 for idx, coord in enumerate(all_final_coords):
+#                     conf.SetAtomPosition(idx, coord.astype(float))
+#                 final_mol.AddConformer(conf)
+#                 fallback_mol = Chem.Mol(final_mol)
+#
+#                 rw_mol_constrained = Chem.RWMol(fallback_mol)
+#                 num_atoms = rw_mol_constrained.GetNumAtoms()
+#                 max_valence = {'C': 4, 'N': 3, 'O': 2, 'S': 6, 'P': 5, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
+#
+#                 connected_frags = set()
+#                 frag_connection_count = {}
+#
+#                 # 🌟 片段之间的拼接，严格保持单键（符合真实化学规律）
+#                 for idx_i in range(num_atoms):
+#                     for idx_j in range(idx_i + 1, num_atoms):
+#                         if not rw_mol_constrained.GetBondBetweenAtoms(idx_i, idx_j):
+#                             p1 = np.array(conf.GetAtomPosition(idx_i))
+#                             p2 = np.array(conf.GetAtomPosition(idx_j))
+#                             dist = np.linalg.norm(p1 - p2)
+#
+#                             if 0.4 < dist < 1.65:
+#                                 frag_i = atom_to_frag.get(idx_i, -1)
+#                                 frag_j = atom_to_frag.get(idx_j, -2)
+#
+#                                 if frag_i != frag_j:
+#                                     pair = tuple(sorted((frag_i, frag_j)))
+#                                     if pair in connected_frags: continue
+#
+#                                     MAX_FRAG_DEGREE = 2
+#                                     if frag_connection_count.get(frag_i, 0) >= MAX_FRAG_DEGREE or \
+#                                             frag_connection_count.get(frag_j, 0) >= MAX_FRAG_DEGREE:
+#                                         continue
+#
+#                                 atom_i = rw_mol_constrained.GetAtomWithIdx(idx_i)
+#                                 atom_j = rw_mol_constrained.GetAtomWithIdx(idx_j)
+#                                 limit_i = max_valence.get(atom_i.GetSymbol(), 4)
+#                                 limit_j = max_valence.get(atom_j.GetSymbol(), 4)
+#
+#                                 if atom_i.GetDegree() < limit_i and atom_j.GetDegree() < limit_j:
+#                                     rw_mol_constrained.AddBond(idx_i, idx_j, Chem.rdchem.BondType.SINGLE)
+#
+#                                     if frag_i != frag_j:
+#                                         connected_frags.add(pair)
+#                                         frag_connection_count[frag_i] = frag_connection_count.get(frag_i, 0) + 1
+#                                         frag_connection_count[frag_j] = frag_connection_count.get(frag_j, 0) + 1
+#
+#                 try:
+#                     Chem.SanitizeMol(rw_mol_constrained, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL)
+#                     final_mol = rw_mol_constrained.GetMol()
+#                 except:
+#                     continue
+#
+#                 try:
+#                     frags = Chem.GetMolFrags(final_mol, asMols=True)
+#                     if not frags: continue
+#                     largest_frag = max(frags, key=lambda m: m.GetNumAtoms())
+#                     if largest_frag.GetNumAtoms() < 5: continue
+#                 except:
+#                     continue
+#
+#                 # =========================================================
+#                 # 🌟 绝杀2：多目标打分，锁定黄金 LogP 与环结构
+#                 # =========================================================
+#                 try:
+#                     c_qed = QED.qed(largest_frag)
+#                     c_sa = sascorer.calculateScore(largest_frag)
+#                     c_logp = Descriptors.MolLogP(largest_frag)
+#
+#                     if 1.0 <= c_logp <= 3.0:
+#                         logp_penalty = 0.0
+#                     elif c_logp < 1.0:
+#                         logp_penalty = (1.0 - c_logp) * 6.0  # 极度重罚
+#                     else:
+#                         logp_penalty = (c_logp - 3.0) * 6.0  # 极度重罚
+#
+#                     ring_info = largest_frag.GetRingInfo()
+#                     atom_rings = ring_info.AtomRings()
+#
+#                     good_rings = 0
+#                     bad_rings = 0
+#                     aromatic_rings = 0
+#
+#                     for ring in atom_rings:
+#                         # 奖励最稳定的 5/6 元环，惩罚奇葩环
+#                         if len(ring) in [5, 6]:
+#                             good_rings += 1
+#                         else:
+#                             bad_rings += 1
+#                         # 识别真正的芳香环
+#                         if all(largest_frag.GetAtomWithIdx(idx).GetIsAromatic() for idx in ring):
+#                             aromatic_rings += 1
+#
+#                     cand_score = (c_qed * 10.0) - c_sa - logp_penalty
+#                     # 芳香环加分，5/6元环加分，奇葩环扣大分
+#                     cand_score += (aromatic_rings * 3.0) + (good_rings * 1.5) - (bad_rings * 3.0)
+#
+#                     if cand_score > best_score:
+#                         best_score = cand_score
+#                         best_mol_candidate = largest_frag
+#
+#                         conf_new = best_mol_candidate.GetConformer()
+#                         best_coords_candidate = [conf_new.GetAtomPosition(i) for i in
+#                                                  range(best_mol_candidate.GetNumAtoms())]
+#                 except:
+#                     continue
+#
+#             # ====================== 10次重采样结束 ======================
+#             if best_mol_candidate is None:
+#                 batch_mols.append((None, None))
+#                 continue
+#
+#             # 🌟 绝杀3：力场-芳香共振
+#             # 因为现在有真实的芳香键了，MMFF 会自动把苯环/吡啶压成完美的平面！
+#             try:
+#                 rdForceFieldHelpers.MMFFOptimizeMolecule(best_mol_candidate, maxIters=1000, nonBondedThresh=100.0)
+#             except:
+#                 pass
+#
+#             try:
+#                 conf_new = best_mol_candidate.GetConformer()
+#                 final_coords_cleaned = [conf_new.GetAtomPosition(i) for i in range(best_mol_candidate.GetNumAtoms())]
+#             except:
+#                 final_coords_cleaned = best_coords_candidate
+#
+#             batch_mols.append((best_mol_candidate, final_coords_cleaned))
+#
+#         return batch_mols
+#
+#
+# # =========================================================================
+# # 后续的数据处理和运行逻辑保持不变
+# # =========================================================================
+# def _ensure_3d_mask(m: torch.Tensor, B: int, N: int, device, default_val: float = 1.0):
+#     if m is None: return torch.full((B, N, 1), float(default_val), device=device)
+#     if not isinstance(m, torch.Tensor): m = torch.tensor(m, dtype=torch.float32, device=device)
+#     if m.dim() == 1:
+#         m = m.view(1, -1, 1).repeat(B, 1, 1)
+#     elif m.dim() == 2:
+#         m = m.unsqueeze(-1)
+#     elif m.dim() == 3:
+#         m = m[:, :, :1]
+#     return m.float().to(device)
+#
+#
+# def _xyz_only(pos: torch.Tensor):
+#     if pos.dim() == 2: pos = pos.unsqueeze(0)
+#     if pos.size(-1) >= 3: return pos[..., :3].contiguous()
+#     raise RuntimeError(f"Position tensor last dim must be >= 3, got {pos.shape}")
+#
+#
+# def read_molecule(path):
+#     mol = None
+#     if path.endswith('.pdb'):
+#         mol = Chem.MolFromPDBFile(path, sanitize=False, removeHs=True)
+#     elif path.endswith('.mol') or path.endswith('.mol2'):
+#         mol = Chem.MolFromMolFile(path, sanitize=False, removeHs=True)
+#     elif path.endswith('.sdf'):
+#         suppl = Chem.SDMolSupplier(path, sanitize=False, removeHs=True)
+#         mol = suppl[0] if len(suppl) > 0 else None
+#     if mol is None: raise ValueError(f"Failed to read molecule from {path}")
+#     return mol
+#
+#
+# def bridge_rdkit_to_openfold_tensor(mol, device='cpu'):
+#     residues = list(mol.GetResidues())
+#     n_res = len(residues)
+#     all_atom_positions = np.zeros((n_res, 37, 3))
+#     all_atom_mask = np.zeros((n_res, 37))
+#     aatype = np.zeros(n_res, dtype=np.int64)
+#     for i, res in enumerate(residues):
+#         res_name = res.GetResidueName().strip()
+#         aatype[i] = rc.restype_order.get(rc.restype_3to1.get(res_name, 'X'), 20)
+#         for atom in res.GetAtoms():
+#             p_info = atom.GetPDBResidueInfo()
+#             if p_info is None: continue
+#             atom_name = p_info.GetName().strip()
+#             if atom_name in rc.atom_order:
+#                 idx = rc.atom_order[atom_name]
+#                 pos = mol.GetConformer().GetAtomPosition(atom.GetIdx())
+#                 all_atom_positions[i, idx] = [pos.x, pos.y, pos.z]
+#                 all_atom_mask[i, idx] = 1.0
+#     return {
+#         "aatype": torch.tensor(aatype, device=device),
+#         "all_atom_positions": torch.tensor(all_atom_positions, dtype=torch.float32, device=device),
+#         "all_atom_mask": torch.tensor(all_atom_mask, dtype=torch.float32, device=device)
+#     }
+#
+#
+# def atom37_to_frames(protein, eps=1e-8):
+#     aatype = protein["aatype"]
+#     all_atom_positions = protein["all_atom_positions"]
+#     all_atom_mask = protein["all_atom_mask"]
+#     batch_dims = len(aatype.shape[:-1])
+#
+#     restype_rigidgroup_base_atom_names = np.full([21, 8, 3], "", dtype=object)
+#     restype_rigidgroup_base_atom_names[:, 0, :] = ["C", "CA", "N"]
+#     restype_rigidgroup_base_atom_names[:, 3, :] = ["CA", "C", "O"]
+#
+#     for restype, restype_letter in enumerate(rc.restypes):
+#         resname = rc.restype_1to3[restype_letter]
+#         for chi_idx in range(4):
+#             if rc.chi_angles_mask[restype][chi_idx]:
+#                 names = rc.chi_angles_atoms[resname][chi_idx]
+#                 restype_rigidgroup_base_atom_names[restype, chi_idx + 4, :] = names[1:]
+#
+#     restype_rigidgroup_mask = all_atom_mask.new_zeros((*aatype.shape[:-1], 21, 8))
+#     restype_rigidgroup_mask[..., 0] = 1
+#     restype_rigidgroup_mask[..., 3] = 1
+#     restype_rigidgroup_mask[..., :20, 4:] = all_atom_mask.new_tensor(rc.chi_angles_mask)
+#
+#     lookuptable = rc.atom_order.copy()
+#     lookuptable[""] = 0
+#     lookup = np.vectorize(lambda x: lookuptable[x])
+#     restype_rigidgroup_base_atom37_idx = lookup(restype_rigidgroup_base_atom_names)
+#     restype_rigidgroup_base_atom37_idx = aatype.new_tensor(restype_rigidgroup_base_atom37_idx)
+#     restype_rigidgroup_base_atom37_idx = restype_rigidgroup_base_atom37_idx.view(*((1,) * batch_dims),
+#                                                                                  *restype_rigidgroup_base_atom37_idx.shape)
+#
+#     residx_rigidgroup_base_atom37_idx = batched_gather(restype_rigidgroup_base_atom37_idx, aatype, dim=-3,
+#                                                        no_batch_dims=batch_dims)
+#     base_atom_pos = batched_gather(all_atom_positions, residx_rigidgroup_base_atom37_idx, dim=-2,
+#                                    no_batch_dims=len(all_atom_positions.shape[:-2]))
+#
+#     gt_frames = Rigid.from_3_points(p_neg_x_axis=base_atom_pos[..., 0, :], origin=base_atom_pos[..., 1, :],
+#                                     p_xy_plane=base_atom_pos[..., 2, :], eps=eps)
+#
+#     group_exists = batched_gather(restype_rigidgroup_mask, aatype, dim=-2, no_batch_dims=batch_dims)
+#     gt_atoms_exist = batched_gather(all_atom_mask, residx_rigidgroup_base_atom37_idx, dim=-1,
+#                                     no_batch_dims=len(all_atom_mask.shape[:-1]))
+#     gt_exists = torch.min(gt_atoms_exist, dim=-1)[0] * group_exists
+#
+#     rots = torch.eye(3, dtype=all_atom_mask.dtype, device=aatype.device)
+#     rots = torch.tile(rots, (*((1,) * batch_dims), 8, 1, 1))
+#     rots[..., 0, 0, 0] = -1
+#     rots[..., 0, 2, 2] = -1
+#     rots = Rotation(rot_mats=rots)
+#     gt_frames = gt_frames.compose(Rigid(rots, None))
+#
+#     gt_frames_tensor = gt_frames.to_tensor_4x4()
+#     protein["rigidgroups_gt_frames"] = gt_frames_tensor
+#     protein["rigidgroups_gt_exists"] = gt_exists
+#     return protein
+#
+#
+# def main(args):
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     os.makedirs(args.output, exist_ok=True)
+#
+#     print(f"🚀 Loading FragDiff model from {args.model}...")
+#     ddpm = DDPM.load_from_checkpoint(args.model, map_location=device).eval().to(device)
+#     if args.n_steps is not None: ddpm.edm.T = args.n_steps
+#     ddpm.reconstruct_and_save = lambda *args, **kwargs: []
+#
+#     if args.linker_size.isdigit():
+#         fixed_size = int(args.linker_size)
+#
+#         def sample_fn(_data):
+#             return torch.full((_data['positions'].shape[0],), fixed_size, device=device, dtype=const.TORCH_INT)
+#     else:
+#         bounds = [int(x.strip()) for x in args.linker_size.split(',')]
+#         left, right = bounds[0], bounds[1]
+#
+#         def sample_fn(_data):
+#             return torch.randint(left, right + 1, (len(_data['positions']),), device=device, dtype=const.TORCH_INT)
+#
+#     dataset_list = []
+#
+#     if args.use_dataset:
+#         print("📁 Running in DATASET MODE")
+#         split_path = args.split_file or os.path.join(args.data_dir, f"{args.dataset_prefix}_split.pt")
+#         full_dataset = PDBbindDataset(data_path=args.data_dir, prefix=args.dataset_prefix, device=device)
+#         split_data = torch.load(split_path)
+#         test_indices = split_data.get('test', []) or split_data.get('val', [])
+#         if args.limit > 0: test_indices = test_indices[:args.limit]
+#
+#         for idx in tqdm(test_indices, desc="Pre-loading Targets"):
+#             try:
+#                 data_item = full_dataset[idx]
+#                 if 'positions' not in data_item: data_item['positions'] = data_item['ligand_pos']
+#                 if 'one_hot' not in data_item:
+#                     elem_map = {1: 0, 6: 0, 7: 1, 8: 2, 9: 3, 15: 4, 16: 5, 17: 6, 35: 7, 53: 8}
+#                     elements = data_item['ligand_element'].view(-1).tolist()
+#                     one_hot = torch.zeros((len(elements), 9), dtype=torch.float32)
+#                     for i, e in enumerate(elements): one_hot[i, elem_map.get(e, 0)] = 1.0
+#                     data_item['one_hot'] = one_hot
+#                 if 'fragment_mask' not in data_item:
+#                     n_atoms = len(data_item['positions'])
+#                     import random
+#                     n_linker = random.randint(1, 3)
+#                     n_frag = max(1, n_atoms - n_linker)
+#                     frag_mask = torch.zeros(n_atoms, dtype=torch.float32)
+#                     frag_mask[:n_frag] = 1.0
+#                     link_mask = torch.zeros(n_atoms, dtype=torch.float32)
+#                     link_mask[n_frag:] = 1.0
+#                     data_item['fragment_mask'] = frag_mask
+#                     data_item['linker_mask'] = link_mask
+#                 if 'anchors' not in data_item: data_item['anchors'] = torch.zeros(len(data_item['positions']),
+#                                                                                   dtype=torch.float32)
+#                 for _ in range(args.n_samples): dataset_list.append({k: v for k, v in data_item.items()})
+#             except Exception:
+#                 pass
+#     else:
+#         print("🧪 Running in SINGLE FILE MODE")
+#         pocket_mol = read_molecule(args.pocket)
+#         pocket_tensor = bridge_rdkit_to_openfold_tensor(pocket_mol, device=device)
+#         pocket_with_frames = atom37_to_frames(pocket_tensor)
+#         pocket_frames = pocket_with_frames["rigidgroups_gt_frames"][:, 0, :, :]
+#         pocket_mask = pocket_with_frames["rigidgroups_gt_exists"][:, 0]
+#
+#         molecule = read_molecule(args.fragments)
+#         positions, one_hot, charges = parse_molecule(molecule, is_geom=ddpm.is_geom)
+#         n_atoms = len(positions)
+#
+#         anchor_flags = np.zeros(n_atoms)
+#         if args.anchors:
+#             for a in args.anchors.split(','): anchor_flags[int(a.strip()) - 1] = 1
+#
+#         single_data = {
+#             'uuid': '0', 'name': os.path.basename(args.fragments).split('.')[0],
+#             'positions': torch.tensor(positions, dtype=torch.float32, device=device),
+#             'one_hot': torch.tensor(one_hot, dtype=torch.float32, device=device),
+#             'charges': torch.tensor(charges, dtype=torch.float32, device=device),
+#             'anchors': torch.tensor(anchor_flags, dtype=torch.float32, device=device),
+#             'fragment_mask': torch.ones(n_atoms, dtype=torch.float32, device=device),
+#             'linker_mask': torch.zeros(n_atoms, dtype=torch.float32, device=device),
+#             'num_atoms': n_atoms,
+#             'pocket_frames': pocket_frames.to(device),
+#             'pocket_mask': pocket_mask.to(device)
+#         }
+#         dataset_list = [single_data] * args.n_samples
+#
+#     if not dataset_list: return
+#     batch_size = min(len(dataset_list), 16)
+#     dataloader = get_dataloader(dataset_list, batch_size=batch_size, collate_fn=collate_with_fragment_edges)
+#
+#     for batch_i, data in enumerate(tqdm(dataloader, desc="Denoising Samples")):
+#         for k, v in data.items():
+#             if isinstance(v, torch.Tensor): data[k] = v.to(device)
+#
+#         bs, n_nodes = data['positions'].shape[0], data['positions'].shape[1]
+#         curr_node_mask = _ensure_3d_mask(data.get('atom_mask', None), bs, n_nodes, device)
+#         curr_edge_mask = None
+#         curr_context = data.get('context', None)
+#
+#         if 'linker_mask' in data and 'fragment_mask' in data:
+#             real_pos_temp = data['positions'].clone()
+#             linker_mask_3d = _ensure_3d_mask(data['linker_mask'], bs, n_nodes, device)
+#             fragment_mask_3d = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device)
+#
+#             raw_noise = torch.randn_like(real_pos_temp)
+#             sum_pos = (real_pos_temp * fragment_mask_3d).sum(dim=1, keepdim=True)
+#             count_pos = fragment_mask_3d.sum(dim=1, keepdim=True).clamp(min=1.0)
+#             center_of_mass = sum_pos / count_pos
+#             aligned_noise = raw_noise + center_of_mass
+#             data['positions'] = torch.where(linker_mask_3d > 0.5, aligned_noise, real_pos_temp)
+#
+#         sample_results = None
+#         for attempt in range(5):
+#             try:
+#                 decoder_instance = RigidAssemblyDecoder()
+#                 my_guidance_fn = lambda x_t, t, base_pred: svdd_qed_guidance(
+#                     x_t, t, base_pred, data, decoder_instance, curr_node_mask, num_samples=3, scale=2.5
+#                 )
+#                 sample_results = ddpm.sample_chain(data, sample_fn=sample_fn, keep_frames=1, edge_mask=curr_edge_mask,
+#                                                    context=curr_context, save_path=None, guidance_fn=my_guidance_fn)
+#                 break
+#             except FoundNaNException:
+#                 continue
+#             except Exception as e:
+#                 import traceback
+#                 print(f"\n❌ 采样过程发生致命错误: {e}")
+#                 traceback.print_exc()
+#                 break
+#
+#         if sample_results is None: continue
+#
+#         chain_data, node_mask = sample_results
+#         while isinstance(chain_data, (tuple, list)): chain_data = chain_data[0]
+#
+#         if chain_data.dim() == 4:
+#             current_chain = chain_data[-1]
+#         else:
+#             current_chain = chain_data
+#
+#         x_gen = current_chain[..., :3]
+#
+#         if 'fragment_mask' in data:
+#             frag_mask_3d = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device)
+#             real_pos = _xyz_only(data['positions'])
+#             x_gen = torch.where(frag_mask_3d > 0.5, real_pos, x_gen)
+#
+#         final_x = x_gen
+#
+#         try:
+#             rot_flat = current_chain[..., 3:12]
+#             rot_gen = rot_flat.view(bs, n_nodes, 3, 3)
+#
+#             if 'frag_rotations' in data and 'fragment_mask' in data:
+#                 frag_mask_3d_rot = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device).unsqueeze(-1)
+#                 real_rot = data['frag_rotations']
+#                 rot_gen = torch.where(frag_mask_3d_rot > 0.5, real_rot, rot_gen)
+#
+#             raw_h_gen = current_chain[..., 12:]
+#             frag_types_gen = raw_h_gen[..., :len(const.NUM2AA)]
+#
+#             decoder = RigidAssemblyDecoder()
+#             mols_and_coords = decoder.assemble(final_x, rot_gen, frag_types_gen, node_mask)
+#
+#             raw_names = data.get('name', [f"target_{batch_i}" for _ in range(bs)])
+#             if isinstance(raw_names, str): raw_names = [raw_names] * bs
+#
+#             for j, (mol, coords) in enumerate(mols_and_coords):
+#                 if mol is None or coords is None: continue
+#                 target_name = raw_names[j]
+#                 sample_idx = batch_i * batch_size + j
+#                 sdf_path = os.path.join(args.output, f"{target_name}_sample_{sample_idx}.sdf")
+#
+#                 final_mol = Chem.Mol(mol)
+#                 try:
+#                     conf = Chem.Conformer(final_mol.GetNumAtoms())
+#                     for idx, coord in enumerate(coords):
+#                         conf.SetAtomPosition(idx, np.array(coord, dtype=np.float64))
+#                     final_mol.RemoveAllConformers()
+#                     final_mol.AddConformer(conf)
+#                 except Exception as e:
+#                     continue
+#
+#                 writer = Chem.SDWriter(sdf_path)
+#                 writer.write(final_mol)
+#                 writer.close()
+#
+#         except Exception as e:
+#             print(f"❌ Batch {batch_i} 组装/保存过程发生错误: {e}")
+#
+#
+# if __name__ == '__main__':
+#     args = parser.parse_args()
+#     main(args)
 import argparse
 import csv
 import os
@@ -13,7 +1584,7 @@ from tqdm import tqdm
 import sys
 from rdkit import RDConfig
 
-
+# 引入合成可及性打分
 sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
 try:
     from src import sascorer
@@ -89,7 +1660,7 @@ parser.add_argument('--save_latent_features', action='store_true')
 
 
 def get_fc_edges(node_mask):
-    'Build fully connected edge indices for batched graphs.'
+    """为 ValueNetwork 构建全连接边索引"""
     B, N, _ = node_mask.shape
     device = node_mask.device
     rows, cols = [], []
@@ -106,32 +1677,32 @@ def get_fc_edges(node_mask):
 
 
 def value_network_guidance(x_t, t, base_eps, rot, h, node_mask, value_net, scale=2.5, max_norm=1.0):
-    'Apply value-guided updates to coordinate noise.'
+    """纯正解析梯度引导：带数学防火墙与 L2 范数方向保持"""
     with torch.enable_grad():
         x_in = x_t.detach().clone().requires_grad_(True)
         edge_index = get_fc_edges(node_mask)
 
-        
+        # 1. 评估未来得分
         expected_score = value_net(x_in, rot, h, t, node_mask, edge_index)
 
-        
+        # 2. 安全求导：allow_unused=True 防止孤立节点导致计算图崩溃
         grad_x = torch.autograd.grad(outputs=expected_score.sum(), inputs=x_in, allow_unused=True)[0]
 
-    
+    # 3. 兜底保护：如果整个图断开返回 None，则给零梯度
     if grad_x is None:
         grad_x = torch.zeros_like(x_in)
 
-    
+    # 4. 张量净化：数学未定义值置零
     grad_x = torch.nan_to_num(grad_x, nan=0.0, posinf=0.0, neginf=0.0)
 
-    
-    
+    # 5. 高阶优化：放弃 Clamp，采用 L2 范数缩放 (保持空间方向向量不变)
+    # 计算每个原子的梯度向量长度
     norm = torch.linalg.norm(grad_x, dim=-1, keepdim=True)
-    
+    # 防止除以 0 的安全缩放系数
     scale_factor = torch.clamp(max_norm / (norm + 1e-8), max=1.0)
     grad_x = grad_x * scale_factor
 
-    
+    # 6. 计算引导后的噪声并再次净化
     guided_eps = base_eps - scale * grad_x
     guided_eps = torch.nan_to_num(guided_eps, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -453,7 +2024,7 @@ class RigidAssemblyDecoder:
         self.frag_bond_types = getattr(const, "FRAGMENT_BOND_TYPES", [])
         self.frag_attachment_points = getattr(const, "FRAGMENT_ATTACHMENT_POINTS", [])
         self.frag_atom_symbols = getattr(const, "FRAGMENT_ATOM_SYMBOLS", [])
-        self.frag_bond_cache = {}  
+        self.frag_bond_cache = {}  # 缓存片段的真实化学键类型
 
     @staticmethod
     def _bond_order_value(bond_type):
@@ -1032,7 +2603,10 @@ class RigidAssemblyDecoder:
         return True
 
     def get_template_bond_type(self, f_type, start_name, end_name):
-        'Return the bond type defined by a fragment template.'
+        """
+        ：模板基因印刻。
+        提取极其完美的片段底层键属性，确保苯环等自带真正的“芳香键”！
+        """
         if f_type not in self.frag_bond_cache:
             try:
                 from rdkit.Chem import rdDetermineBonds
@@ -1044,7 +2618,7 @@ class RigidAssemblyDecoder:
                     elem_symbol = "".join([c for c in raw_name if c.isalpha()])
                     if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
                         elem_symbol = elem_symbol[0]
-                    
+                    # 我们需要H来帮助判断真实价态，不跳过H
                     idx = temp_mol.AddAtom(Chem.Atom(elem_symbol.capitalize()))
                     idx_map[raw_name] = idx
                     conf.SetAtomPosition(idx, np.array(atom_info[2]).astype(float))
@@ -1115,7 +2689,7 @@ class RigidAssemblyDecoder:
             best_fragment_type_indices = None
             mmff_rmsd = 0.0
 
-            
+            # 重采样抽卡 10 次
             for attempt in range(self.decoder_attempts):
                 b_type_idx = torch.multinomial(probs, num_samples=1).squeeze(-1).cpu().numpy()
 
@@ -1131,7 +2705,7 @@ class RigidAssemblyDecoder:
                     t = b_pos[i].copy()
                     R_raw = b_rot[i]
 
-                    
+                    # 宏观碰撞排斥
                     # for prev_t in centers:
                     #     dist = np.linalg.norm(t - prev_t)
                     #     if dist < 3.8:
@@ -1180,7 +2754,7 @@ class RigidAssemblyDecoder:
                         v = local_atom_map.get(end_name.strip())
                         if u is not None and v is not None:
                             if not rw_mol.GetBondBetweenAtoms(u, v):
-                                
+                                # 直接打上芳香键和双键的烙印！
                                 correct_bond_type = self._template_bond_type(f_type, bond_idx)
                                 rw_mol.AddBond(u, v, correct_bond_type)
                                 if correct_bond_type == Chem.rdchem.BondType.AROMATIC:
@@ -1238,26 +2812,26 @@ class RigidAssemblyDecoder:
                 connected_frags = set()
                 frag_connection_count = {}
 
-                
+                # 片段之间的拼接，严格保持单键（符合真实化学规律）
                 for idx_i in range(0):
                     for idx_j in range(idx_i + 1, num_atoms):
                         if not rw_mol_constrained.GetBondBetweenAtoms(idx_i, idx_j):
                             frag_i = atom_to_frag.get(idx_i, -1)
                             frag_j = atom_to_frag.get(idx_j, -2)
 
-                            
+                            # 如果是不同片段之间的原子
                             if frag_i != frag_j:
-                                
+                                # 直接读取神经网络给出的拓扑判定！
                                 if final_bonds is not None and final_bonds[b, frag_i, frag_j] == 1:
 
-                                    
+                                    # 🚨 必须加上物理距离保护！否则远距离连键会导致最后的力场(MMFF)瞬间爆炸
                                     p1 = np.array(conf.GetAtomPosition(idx_i))
                                     p2 = np.array(conf.GetAtomPosition(idx_j))
                                     dist = np.linalg.norm(p1 - p2)
 
-                                    if dist < 2.5:  
-                                        
-                                        
+                                    if dist < 2.5:  # 只有物理距离在合理范围内，才真正执行连键！
+                                        # 网络钦定这两个片段之间有键！直接连！
+                                        # 加入基础的化合价安全锁（防范极小概率的网络幻觉）
                                         atom_i = rw_mol_constrained.GetAtomWithIdx(idx_i)
                                         atom_j = rw_mol_constrained.GetAtomWithIdx(idx_j)
                                         limit_i = max_valence.get(atom_i.GetSymbol(), 4)
@@ -1286,10 +2860,10 @@ class RigidAssemblyDecoder:
                     continue
 
                 # =========================================================
-                
+                # ：多目标打分，锁定黄金 LogP 与环结构
                 # =========================================================
                 try:
-                    
+                    # 直接计算 QED (成药性) 作为挑选最优分子的唯一标准
                     metrics = calculate_composite_metrics(connected_mol)
                     if metrics is None:
                         continue
@@ -1333,7 +2907,7 @@ class RigidAssemblyDecoder:
                 except:
                     continue
 
-            
+            # ====================== 10次重采样结束 ======================
             if best_mol_candidate is None:
                 batch_mols.append((None, None, {
                     "assembly_success": False,
@@ -1347,22 +2921,22 @@ class RigidAssemblyDecoder:
                 }))
                 continue
 
-            
-            
+            # 力场-芳香共振
+            # 因为现在有真实的芳香键了，MMFF 会自动把苯环/吡啶压成完美的平面
             force_field_success = False
 
             if best_coords_candidate is not None and len(best_coords_candidate) > 1:
                 coords_array = np.array(best_coords_candidate, dtype=np.float64)
 
-                
+                # 1. 终极防线：检测原始坐标是否已经存在 NaN
                 if not np.isnan(coords_array).any() and not np.isinf(coords_array).any():
                     from scipy.spatial.distance import pdist
 
-                    
+                    # 2. 距离矩阵预检：筛查是否存在极端空间坍缩 (< 0.5 埃)
                     min_dist = np.min(pdist(coords_array))
                     if min_dist > 0.5:
                         try:
-                            
+                            # 3. 安全调用力场
                             mmff_props = AllChem.MMFFGetMoleculeProperties(best_mol_candidate)
                             if mmff_props is None:
                                 raise ValueError("MMFF parameters unavailable")
@@ -1374,13 +2948,13 @@ class RigidAssemblyDecoder:
                             force_field.Initialize()
                             force_field.Minimize(maxIts=200)
 
-                            
+                            # 4. 严密校验力场返回值
                             conf_new = best_mol_candidate.GetConformer()
                             opt_coords = np.array(
                                 [conf_new.GetAtomPosition(i) for i in range(best_mol_candidate.GetNumAtoms())],
                                 dtype=np.float64)
 
-                            
+                            # 5. math.isnan 最终检测，防止力场内部将坐标算成 NaN
                             if not np.isnan(opt_coords).any() and not np.isinf(opt_coords).any():
                                 displacement = opt_coords - coords_array
                                 displacement -= displacement.mean(axis=0, keepdims=True)
@@ -1396,10 +2970,10 @@ class RigidAssemblyDecoder:
                         except Exception:
                             pass
 
-            
+            # 6. 安全回退机制 (Fallback)：力场崩溃或预检未通过，强制使用扩散模型原始坐标
             if not force_field_success:
                 final_coords_cleaned = best_coords_candidate
-                
+                # 确保连保底原始坐标也没有 NaN，如果有，彻底丢弃该分子
                 if final_coords_cleaned is None or np.isnan(np.array(final_coords_cleaned, dtype=np.float64)).any():
                     batch_mols.append((None, None, {
                         "assembly_success": False,
@@ -1562,6 +3136,13 @@ def main(args):
         map_location=device,
         strict=False,
     ).eval().to(device)
+    if ddpm.apply_ema_weights():
+        print(
+            f"EMA weights activated (decay={ddpm.ema_decay:.6f}, "
+            f"updates={ddpm._ema_num_updates})."
+        )
+    else:
+        print("EMA weights not found; using raw checkpoint weights.")
     if args.n_steps is not None: ddpm.edm.T = args.n_steps
     ddpm.reconstruct_and_save = lambda *args, **kwargs: []
     """
@@ -1671,14 +3252,14 @@ def main(args):
                     key: (value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value))
                     for key, value in data_item.items()
                 }
-                
+                # 强制 De Novo 生成，彻底抛弃原配体的大小
                 if args.linker_size.isdigit():
                     sampled_size = int(args.linker_size)
                 else:
                     bounds = [int(x.strip()) for x in args.linker_size.split(',')]
                     sampled_size = bounds[1]
 
-                
+                # 提取口袋中心（或原配体中心）作为新片段的出生点
                 if 'ligand_pos' in data_item:
                     center_pos = data_item['ligand_pos'].mean(dim=0)
                 elif 'positions' in data_item:
@@ -1686,7 +3267,7 @@ def main(args):
                 else:
                     center_pos = torch.zeros(3, device=device)
 
-                
+                # 强行覆盖数据：构造全新的 sampled_size (8~12) 个空白片段节点
                 data_item['positions'] = center_pos.unsqueeze(0).repeat(sampled_size, 1)
                 data_item['frag_rotations'] = torch.eye(3).unsqueeze(0).repeat(sampled_size, 1, 1)
 
@@ -1821,10 +3402,10 @@ def main(args):
         bs, n_nodes = data['positions'].shape[0], data['positions'].shape[1]
 
         # =========================================================================
-        
-        
+        # 严格掩码保真度与拓扑动态切片 (Strict Mask Fidelity)
+        # 废除盲目覆写全局！利用 one_hot 特征提取出当前批次真实的原子数，屏蔽 Padding 虚拟节点
         # =========================================================================
-        
+        # 只要特征维度上有激活，就说明是真实节点
         if 'atom_mask' in data:
             valid_node_mask = _ensure_3d_mask(data['atom_mask'], bs, n_nodes, device)
         else:
@@ -1855,36 +3436,36 @@ def main(args):
             fragment_mask_3d = _ensure_3d_mask(data['fragment_mask'], bs, n_nodes, device)
 
             raw_noise = torch.randn_like(real_pos_temp)
-            
+            # 净化初始噪声
             raw_noise = torch.nan_to_num(raw_noise, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-            
+            # 1. 检查当前分子是否有预先保留的骨架 (fragment)
             has_frag = (fragment_mask_3d.sum(dim=1, keepdim=True) > 0.5).float()
 
-            
+            # 2. 如果有保留骨架，质心就是骨架的质心
             sum_pos = (real_pos_temp * fragment_mask_3d).sum(dim=1, keepdim=True)
             count_pos = fragment_mask_3d.sum(dim=1, keepdim=True).clamp(min=1.0)
             frag_center = sum_pos / count_pos
 
-            
-            
+            # 3.  (De Novo)，质心必须是蛋白质口袋的中心！
+            # 因为我们在 Dataset 阶段已经把 De Novo 的 real_pos_temp 初始化在口袋中心了，所以直接取均值
             valid_nodes_count = valid_node_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
             pocket_center = (real_pos_temp * valid_node_mask).sum(dim=1, keepdim=True) / valid_nodes_count
 
-            
+            # 4. 智能选择：锚点 = 骨架质心 (如果有) or 口袋质心 (如果从头生成)
             center_of_mass = frag_center * has_frag + pocket_center * (1.0 - has_frag)
 
-            
+            # 5. 将高斯噪声精准空投到蛋白质口袋内部！
             aligned_noise = raw_noise + center_of_mass
             data['positions'] = torch.where(linker_mask_3d > 0.5, aligned_noise, real_pos_temp)
 
         try:
             if False:
                 value_network_guidance(
-            
+            # 提取初始旋转矩阵 (如果不存在则用单位阵兜底)
 
-                scale=2.0  
+                scale=2.0  # 引导强度
             )
 
 
@@ -1903,7 +3484,7 @@ def main(args):
 
         except Exception as e:
             import traceback
-            print(f"\nSampling failed: {e}")
+            print(f"\n❌ 采样过程发生致命错误: {e}")
             traceback.print_exc()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2087,7 +3668,7 @@ def main(args):
                 write_metrics_csv(all_candidates, args.output)
 
         except Exception as e:
-            print(f"Batch {batch_i} assembly or save failed: {e}")
+            print(f"❌ Batch {batch_i} 组装/保存过程发生错误: {e}")
 
 
     selected_candidates = select_diverse_candidates(

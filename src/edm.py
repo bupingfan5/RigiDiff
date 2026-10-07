@@ -15,9 +15,19 @@ from src.pocket_geometry import (
 
 
 class ValueNetworkGuidance:
-    'Gradient guidance wrapper for diffusion sampling.'
+    """
+    价值网络梯度引导包装类
+
+    在采样过程中应用梯度引导：ε̂ = ε - λ∇_{X_t}V_φ
+    """
     def __init__(self, value_net, guidance_scale=0.4, start_step=50, end_step=700, max_norm=1.0):
-        'Initialize guidance parameters.'
+        """
+        Args:
+            value_net: 训练好的价值网络模型
+            guidance_scale: 引导强度 λ
+            start_step: 开始应用引导的时间步
+            end_step: 停止应用引导的时间步
+        """
         self.value_net = value_net
         self.guidance_scale = guidance_scale
         self.start_step = start_step
@@ -26,20 +36,34 @@ class ValueNetworkGuidance:
         self.last_delta_norm = 0.0
 
     def __call__(self, x, rot, h, t, pred_eps_x, node_mask, edge_index):
-        'Apply value-function gradient guidance to predicted noise.'
-        
+        """
+        应用价值网络梯度引导
+
+        Args:
+            x: [B, N, 3] 当前位置
+            rot: [B, N, 3, 3] 当前旋转
+            h: [B, N, F] 节点特征
+            t: [B] 当前时间步
+            pred_eps_x: [B, N, 3] 网络预测的噪声
+            node_mask: [B, N, 1] 节点掩码
+            edge_index: [2, E] 边索引
+
+        Returns:
+            guided_eps_x: [B, N, 3] 引导后的噪声预测
+        """
+        # 检查是否在引导范围内
         t_val = t[0].item() if isinstance(t, torch.Tensor) else t
         if t_val < self.start_step or t_val > self.end_step:
             self.last_delta_norm = 0.0
             return pred_eps_x
 
-        
+        # 启用梯度计算
         x_guided = x.detach().clone().requires_grad_(True)
 
-        
+        # 计算价值函数
         value = self.value_net(x_guided, rot, h, t, node_mask, edge_index)
 
-        
+        # 计算梯度 ∇_{X_t}V_φ
         grad_value = torch.autograd.grad(
             outputs=value.sum(),
             inputs=x_guided,
@@ -48,7 +72,7 @@ class ValueNetworkGuidance:
             allow_unused=True
         )[0]
 
-        
+        # 应用引导：ε̂ = ε - λ∇_{X_t}V_φ
         if grad_value is None:
             grad_value = torch.zeros_like(x_guided)
         grad_value = torch.nan_to_num(grad_value, nan=0.0, posinf=0.0, neginf=0.0)
@@ -198,6 +222,21 @@ def _sample_noisy_type_state(type_state, t, num_classes, type_alphas_cumprod, de
     ).view(B, N)
 
 
+def _sanitize_categorical_probabilities(probabilities, fallback_indices):
+    """Make categorical rows safe for multinomial, preserving state on failure."""
+    probabilities = torch.nan_to_num(
+        probabilities.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(0.0)
+    totals = probabilities.sum(dim=-1, keepdim=True)
+    valid = torch.isfinite(totals) & (totals > 0.0)
+    normalized = probabilities / totals.clamp_min(1e-12)
+    fallback = F.one_hot(
+        fallback_indices.long().clamp(0, probabilities.shape[-1] - 1),
+        num_classes=probabilities.shape[-1],
+    ).to(dtype=normalized.dtype)
+    return torch.where(valid, normalized, fallback)
+
+
 def _bond_reverse_posterior(z_bond_t, pred_bonds_logits, t, bond_alphas_cumprod, num_classes, device):
     """
     Strict D3PM reverse posterior:
@@ -242,7 +281,8 @@ def _bond_reverse_posterior(z_bond_t, pred_bonds_logits, t, bond_alphas_cumprod,
 
     # ---------- term 1: q(z_t=m | z_{t-1}=k) evaluated at z_t=known --------
     # z_t_onehot[..., k] = 1 iff z_t == k  →  plays role of selecting column m=z_t
-    z_t_onehot = F.one_hot(z_bond_t.long(), num_classes=C).float()  # [B,N,N,C]
+    safe_z_bond_t = z_bond_t.long().clamp(0, C - 1)
+    z_t_onehot = F.one_hot(safe_z_bond_t, num_classes=C).float()  # [B,N,N,C]
     # q(z_t | z_{t-1}=k) = (1−β)·δ(k,z_t) + β/C
     q_zt_zt1 = (1.0 - beta_t) * z_t_onehot + beta_t / C            # [B,N,N,C]
 
@@ -252,11 +292,10 @@ def _bond_reverse_posterior(z_bond_t, pred_bonds_logits, t, bond_alphas_cumprod,
 
     # ---------- unnormalized posterior, normalize, sample -------------------
     posterior = q_zt_zt1 * theta_t1                                  # [B,N,N,C]
-    posterior = posterior.clamp(min=1e-8)
-    posterior = posterior / posterior.sum(dim=-1, keepdim=True)
+    posterior = _sanitize_categorical_probabilities(posterior, safe_z_bond_t)
 
     z_bond_t_minus_1 = torch.multinomial(
-        posterior.view(B * N * N, C),
+        posterior.reshape(B * N * N, C),
         num_samples=1
     ).view(B, N, N)
 
@@ -289,11 +328,10 @@ def _type_reverse_posterior(z_type_t, pred_type_logits, t, type_alphas_cumprod, 
     theta_t1 = abt1 * pred_probs + (1.0 - abt1) / C
 
     posterior = q_zt_zt1 * theta_t1
-    posterior = posterior.clamp(min=1e-8)
-    posterior = posterior / posterior.sum(dim=-1, keepdim=True)
+    posterior = _sanitize_categorical_probabilities(posterior, z_type_t)
 
     return torch.multinomial(
-        posterior.view(B * N, C),
+        posterior.reshape(B * N, C),
         num_samples=1,
     ).view(B, N)
 
@@ -413,14 +451,14 @@ class EDM(nn.Module):
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(bs, 1, 1)
         sqrt_sigma = self.sqrt_one_minus_alphas_cumprod[t].view(bs, 1, 1)
 
-        
+        # 1. 位置扩散 (Euclidean)
         eps_x = torch.randn_like(x)
         z_x = sqrt_alpha * x + sqrt_sigma * eps_x
 
-        
+        # 2. 旋转扩散 (SO3): 使用独立的 rot_sigmas，与坐标 schedule 解耦
         z_rot, eps_rot = isotropic_gaussian_so3(rot, t, self.rot_sigmas)
 
-        
+        # 3. 化学键扩散 (Discrete Markov Chain): 使用 bond_alphas_cumprod
         z_bond = None
         if true_bonds is not None:
             num_bond_classes = 5  # 0:none, 1:single, 2:double, 3:triple, 4:aromatic
@@ -440,7 +478,7 @@ class EDM(nn.Module):
             h_t = F.one_hot(z_type, num_classes=num_type_classes).to(dtype=h.dtype)
             h_t = h_t * node_mask
 
-        
+        # 4. 网络联合预测
         (
             pred_eps_x,
             pred_eps_rot,
@@ -458,19 +496,19 @@ class EDM(nn.Module):
             pocket_aa_type=pocket_aa_type,
             pocket_is_backbone=pocket_is_backbone,
             linker_mask=linker_mask,
-            bond_state=z_bond  
+            bond_state=z_bond  # 传递噪声化学键状态
         )
 
         weight = (linker_mask * node_mask).squeeze(-1)
         loss_x = (pred_eps_x.float() - eps_x.float()).pow(2).sum(dim=-1)
         loss_x = (loss_x * weight).sum() / (weight.sum() + 1e-8)
 
-        
+        # 旋转 Loss: 在切空间（Angle-axis）计算 MSE
         loss_rot = (pred_eps_rot.float() - eps_rot.float()).pow(2).sum(dim=-1)
         loss_rot = (loss_rot * weight).sum() / (weight.sum() + 1e-8)
 
-        
-        
+        # 1. 反推去噪后模型心目中的“干净坐标” pred_x0
+        # 根据公式：z_x = sqrt_alpha * x0 + sqrt_sigma * eps_x
         # Auxiliary x0 geometry is evaluated in FP32. Near the end of the
         # diffusion schedule, division by sqrt(alpha_bar) can overflow FP16.
         pred_x0 = (
@@ -494,17 +532,17 @@ class EDM(nn.Module):
             neginf=-1.0,
         ).clamp(min=-1.0, max=1.0)
 
-        
+        # 2. 计算预测的节点(片段质心)间的两两距离平方
         dist_sq = torch.sum(
             (pred_x0_aux.unsqueeze(1) - pred_x0_aux.unsqueeze(2)) ** 2,
             dim=-1,
         )
 
-        
+        # 3. 构造有效节点的 2D Mask (只让参与生成的节点互相排斥)
         dist = torch.sqrt(dist_sq + 1e-8)
         mask_2d = weight.unsqueeze(1) * weight.unsqueeze(2)
-        mask_2d.diagonal(dim1=1, dim2=2).fill_(0)  
-        
+        mask_2d.diagonal(dim1=1, dim2=2).fill_(0)  # 自己不跟自己算排斥
+        # 核心：引入化学键交叉熵 (Cross Entropy) 与 几何引导损失 (GFLoss)
         # =====================================================================
         loss_bond = torch.tensor(0.0, device=device)
         loss_gf = torch.tensor(0.0, device=device)
@@ -523,7 +561,7 @@ class EDM(nn.Module):
                 loss_type = F.cross_entropy(valid_type_logits, valid_type_true)
 
         if true_bonds is not None:
-            
+            # A. 拓扑分类损失 (Cross Entropy)
             upper_triangle = torch.triu(
                 torch.ones(n_nodes, n_nodes, dtype=torch.bool, device=device),
                 diagonal=1,
@@ -569,7 +607,7 @@ class EDM(nn.Module):
                 bond_recall = true_positive / true_edge.sum().clamp_min(1).float()
                 predicted_no_bond_rate = (~predicted_edge).float().mean()
 
-            
+            # C. 智能排斥力 (只对预测“无键”的原子生效，防止鸟巢重叠)
         safe_dist_sq = 3.6 ** 2
         no_bond_probs = torch.softmax(pred_bonds_logits.float(), dim=-1)[..., 0] if true_bonds is not None else 1.0
         repulsive_energy = torch.relu(safe_dist_sq - dist_sq) * mask_2d * no_bond_probs
@@ -644,7 +682,7 @@ class EDM(nn.Module):
                 sample_weight=sqrt_alpha.reshape(bs),
             )
 
-        
+        # 💥 联合多模态损失函数 (Weights 可调)
         lambda_bond = 1.0
         lambda_type = 1.0
         clash_weight = float(kwargs.get("clash_weight", 1.0))
@@ -762,6 +800,21 @@ class EDM(nn.Module):
                     bond_state=z_bond,
                 )
 
+            # Prevent one corrupt prediction from poisoning the complete
+            # reverse chain or reaching torch.multinomial as an invalid row.
+            pred_eps_x = torch.nan_to_num(
+                pred_eps_x, nan=0.0, posinf=100.0, neginf=-100.0
+            ).clamp(min=-100.0, max=100.0)
+            pred_eps_rot = torch.nan_to_num(
+                pred_eps_rot, nan=0.0, posinf=100.0, neginf=-100.0
+            ).clamp(min=-100.0, max=100.0)
+            pred_bonds_logits = torch.nan_to_num(
+                pred_bonds_logits.float(), nan=0.0, posinf=30.0, neginf=-30.0
+            ).clamp(min=-30.0, max=30.0)
+            pred_type_logits = torch.nan_to_num(
+                pred_type_logits.float(), nan=0.0, posinf=30.0, neginf=-30.0
+            ).clamp(min=-30.0, max=30.0)
+
             if guidance_fn is not None and getattr(guidance_fn, "requires_pocket_context", False):
                 guidance_pocket_elements = pocket_element
                 if guidance_pocket_elements is None:
@@ -860,12 +913,18 @@ class EDM(nn.Module):
             final_attach_dst = pred_attach_dst_logits
 
             # Position update (DDPM reverse step)
+            pred_eps_x = torch.nan_to_num(
+                pred_eps_x, nan=0.0, posinf=100.0, neginf=-100.0
+            ).clamp(min=-100.0, max=100.0)
             beta    = self.betas[i]
             c_mean  = 1.0 / torch.sqrt(self.alphas[i])
             c_noise = beta / torch.sqrt(1.0 - self.alphas_cumprod[i] + 1e-12)
             noise_z = torch.randn_like(z_x) * temperature if i > 0 else 0
             z_x = c_mean * (z_x - c_noise * pred_eps_x) + torch.sqrt(beta) * noise_z
             z_x = x * fragment_mask + z_x * linker_mask  # Inpaint fragments
+            z_x = torch.nan_to_num(
+                z_x, nan=0.0, posinf=100.0, neginf=-100.0
+            ).clamp(min=-100.0, max=100.0)
 
             gen_mask = (linker_mask * node_mask).to(dtype=z_x.dtype)
             has_fixed_fragment = fragment_mask.sum(dim=(1, 2), keepdim=True) > 0.5
@@ -963,7 +1022,7 @@ class EDM(nn.Module):
         return result
 
     def _build_edge_index(self, bs, n_nodes, device):
-        'Build fully connected edge indices for the value network.'
+        """构建全连接边索引（用于价值网络）"""
         rows, cols = [], []
         for b in range(bs):
             for i in range(n_nodes):

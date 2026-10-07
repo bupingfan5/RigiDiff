@@ -435,7 +435,13 @@ class PocketFeatureEncoder(nn.Module):
 
 
 class Dynamics(nn.Module):
-    'EGNN diffusion dynamics with sparse k-nearest-neighbor graphs.'
+    """
+    Diffusion dynamics model. Must return:
+      pred_eps_x:  [B, N_lig, 3]
+      pred_eps_rot:[B, N_lig, 3]
+
+    ✅ 本版修复显存爆炸的根源：彻底禁用 FC N^2 全连接边，强制使用稀疏 kNN 图。
+    """
 
     def __init__(
         self,
@@ -458,7 +464,7 @@ class Dynamics(nn.Module):
         norm_constant=1,
         tanh=False,
         normalization=None,
-        
+        # ✅ 新增：稀疏图超参（默认稳）
         knn_lig=32,
         knn_lp=64,
         lp_undirected=True,
@@ -475,7 +481,7 @@ class Dynamics(nn.Module):
         self.tanh = tanh
         self.normalization = normalization
 
-        
+        # ✅ 稀疏图参数
         self.knn_lig = int(knn_lig)
         self.knn_lp = int(knn_lp)
         self.lp_undirected = bool(lp_undirected)
@@ -516,18 +522,18 @@ class Dynamics(nn.Module):
         else:
             raise NotImplementedError("Only Rigid EGNN dynamics is supported")
 
-        
+        # 旧缓存函数保留（不再使用 FC）
         self.edge_cache = {}
         self.opt_edge_cache = {}
-        
+        # 作用：替代距离推断，直接在隐空间中预测离散拓扑 (0:无键, 1:有键)
         # ==============================================================
-        
+        # EGNN 最终输出特征维度为 in_node_nf，两两拼接后输入维度为 in_node_nf * 2
         self.edge_predictor = nn.Sequential(
             nn.Linear(in_node_nf * 2, hidden_nf),
             activation if not isinstance(activation, str) else nn.SiLU(),
             nn.Linear(hidden_nf, hidden_nf // 2),
             activation if not isinstance(activation, str) else nn.SiLU(),
-            nn.Linear(hidden_nf // 2, 2)  
+            nn.Linear(hidden_nf // 2, 2)  # 输出二分类 Logits: [Logit(无键), Logit(有键)]
         )
         self.edge_predictor[-1] = nn.Linear(hidden_nf // 2, 5)
         self.node_predictor = nn.Sequential(
@@ -560,7 +566,7 @@ class Dynamics(nn.Module):
         )
 
     # -------------------------
-    
+    # ✅ 稀疏建边：lig-lig kNN
     # -------------------------
     @torch.no_grad()
     def _knn_edges_ligand(self, x_lig: torch.Tensor, lig_mask: torch.Tensor, k: int):
@@ -613,7 +619,7 @@ class Dynamics(nn.Module):
         return torch.cat(rows_all).long(), torch.cat(cols_all).long()
 
     # -------------------------
-    
+    #  稀疏建边：lig-pocket bipartite kNN（可双向）
     # -------------------------
     @torch.no_grad()
     def _knn_edges_lig_pocket(self, x_lig, x_poc, lig_mask, poc_mask, k: int, make_undirected: bool = True):
@@ -674,7 +680,7 @@ class Dynamics(nn.Module):
         return torch.cat(rows_all).long(), torch.cat(cols_all).long()
 
     # -------------------------
-    
+    # legacy (保留，但不再用于训练，以免 FC OOM)
     # -------------------------
     def get_optimised_edges(self, n_ligand, n_pocket, batch_size):
         cache_key = (n_ligand, n_pocket, batch_size)
@@ -710,7 +716,7 @@ class Dynamics(nn.Module):
         return edge_index
 
     def get_edges(self, n_nodes, batch_size):
-        
+        # ⚠️ 旧版 FC 全连接，保留但不再使用
         if n_nodes in self.edge_cache:
             edges_dic_b = self.edge_cache[n_nodes]
             if batch_size in edges_dic_b:
@@ -822,7 +828,7 @@ class Dynamics(nn.Module):
 
             all_node_mask = torch.cat([node_mask, pocket_mask], dim=1)      # [B, Ntot, 1]
 
-            
+            #  稀疏 edges: lig-lig kNN + lig-pocket bipartite kNN (NO pocket-pocket)
             r_ll, c_ll = self._knn_edges_ligand(x, node_mask, k=self.knn_lig)
             r_lp, c_lp = self._knn_edges_lig_pocket(
                 x_lig=x,
@@ -833,12 +839,12 @@ class Dynamics(nn.Module):
                 make_undirected=self.lp_undirected,
             )
 
-            
-            
-            
+            # 注意：r_lp/c_lp 是在 merged graph 下（Nl+Np）索引并含 batch offset
+            # r_ll/c_ll 是 ligand-only 索引并含 batch offset（基于 Nl）
+            #  需要把 r_ll/c_ll 也转成 merged graph 的 batch offset格式：offset 应该是 b*(Nl+Np) 而不是 b*Nl
             if n_pocket > 0 and r_ll.numel() > 0:
-                
-                
+                # 重新映射 r_ll/c_ll 的 batch offset
+                # r_ll = local + b*Nl；需要改为 local + b*(Nl+Np)
                 b_id = (r_ll // n_nodes)
                 local_r = r_ll % n_nodes
                 local_c = c_ll % n_nodes
@@ -848,7 +854,7 @@ class Dynamics(nn.Module):
             edges = [torch.cat([r_ll, r_lp]).long(), torch.cat([c_ll, c_lp]).long()]
 
         else:
-            
+            # 没 pocket 也不允许 FC，仍用 ligand kNN
             all_x, all_rot, all_h = x, rot, h
             n_total = n_nodes
             all_movable = movable_mask
@@ -968,7 +974,7 @@ class Dynamics(nn.Module):
 
                 all_h_f = torch.cat([all_h_f, all_ctx], dim=1)
 
-        
+        # Forward dynamics (稀疏边)
         h_final_f, _, _, eps_x_f, eps_rot_f = self.dynamics(
             all_h_f,
             all_x_f,
@@ -984,33 +990,33 @@ class Dynamics(nn.Module):
         eps_x = eps_x_f.view(bs, n_total, 3)[:, :n_nodes, :]
         eps_rot = eps_rot_f.view(bs, n_total, 3)[:, :n_nodes, :]
 
-        
+        # 提取出配体 (Ligand) 的节点特征，用于预测化学键
         h_ligand = h_final_f.view(bs, n_total, -1)[:, :n_nodes, :]
 
         eps_x = eps_x * node_mask
         eps_rot = eps_rot * node_mask
 
         # ==============================================================
-        
+        # ：基于配体隐层特征，预测全局化学键概率图 (N x N)
         # ==============================================================
-        
+        # 1. 构造 N x N 的节点特征对 (Pairs)
         # h_ligand: [B, N, F] -> h_row: [B, N, N, F], h_col: [B, N, N, F]
         h_row = h_ligand.unsqueeze(2).expand(bs, n_nodes, n_nodes, -1)
         h_col = h_ligand.unsqueeze(1).expand(bs, n_nodes, n_nodes, -1)
-        h_pairs = torch.cat([h_row, h_col], dim=-1)  
+        h_pairs = torch.cat([h_row, h_col], dim=-1)  # 拼接后形状: [B, N, N, 2F]
 
-        
-        pred_bonds_logits = self.edge_predictor(h_pairs)  
+        # 2. 送入预测头，得出未归一化的分类概率 (Logits)
+        pred_bonds_logits = self.edge_predictor(h_pairs)  # 形状: [B, N, N, 2]
 
-        
+        # 3. 物理约束：化学键是无向图，矩阵必须是对称的 P_ij = P_ji
         pred_bonds_logits = (pred_bonds_logits + pred_bonds_logits.transpose(1, 2)) / 2.0
 
-        
+        # 4. 遮罩清理：只保留有效原子间的预测，把 Padding 产生的虚拟原子边置 0
         mask_2d = (node_mask @ node_mask.transpose(1, 2)).unsqueeze(-1)  # [B, N, N, 1]
         pred_bonds_logits = pred_bonds_logits * mask_2d
         pred_type_logits = self.node_predictor(h_ligand) * node_mask
 
-        
+        # 返回时，除了坐标和旋转，将预测的键矩阵一并传出！
         pred_attach_src_logits = self.attach_src_predictor(h_pairs) * mask_2d
         pred_attach_dst_logits = self.attach_dst_predictor(h_pairs) * mask_2d
         pred_node_logits = self.presence_predictor(h_ligand) * node_mask

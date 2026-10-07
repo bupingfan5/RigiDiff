@@ -25,21 +25,26 @@ DEBUG_EVERY_N = 0
 
 
 def _build_frames_from_pos_rot(pos: torch.Tensor, rot: torch.Tensor):
-    'Build homogeneous transforms from positions and rotations.'
+    """
+    支持 Batch 处理的 Frame 构造函数
+    pos: [B, N, 3] 或 [N, 3]
+    rot: [B, N, 3, 3] 或 [N, 3, 3]
+    返回: [B, N, 4, 4] 或 [N, 4, 4]
+    """
     device, dtype = pos.device, pos.dtype
 
-    
-    original_shape = pos.shape[:-1]  
+    # 获取原始形状
+    original_shape = pos.shape[:-1]  # 获取 (B, N) 或 (N,)
     n_nodes = pos.size(-2)
 
-    
-    
-    if pos.dim() == 3:  
+    # 构造单位矩阵底标
+    # 使用 reshape 适配 Batch 维度
+    if pos.dim() == 3:  # Batch 模式 [B, N, 3]
         batch_size = pos.size(0)
         frames = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4).repeat(batch_size, n_nodes, 1, 1)
         frames[..., :3, :3] = rot
         frames[..., :3, 3] = pos
-    else:  
+    else:  # 单样本模式 [N, 3]
         frames = torch.eye(4, device=device, dtype=dtype).view(1, 4, 4).repeat(n_nodes, 1, 1)
         frames[:, :3, :3] = rot
         frames[:, :3, 3] = pos
@@ -48,7 +53,11 @@ def _build_frames_from_pos_rot(pos: torch.Tensor, rot: torch.Tensor):
 
 
 def _bondtype_from_int(b):
-    'Map an integer label to an RDKit bond type.'
+    """
+    你 LMDB 里 bond_type 常见约定：
+    1=single, 2=double, 3=triple, 4=aromatic
+    不同数据集略有差异，这里做一个稳健映射
+    """
     if isinstance(b, (np.ndarray, list)):
         b = int(b[0])
     b = int(b)
@@ -77,12 +86,15 @@ def _bondtype_to_int(bond_type):
 
 
 def brics_fragment_atom_indices(mol):
-    'Split a molecule into BRICS fragments and fragment edges.'
+    """
+    返回 BRICS 切分后每个片段包含的“原子 index 列表”，
+    以及这些片段之间的“连接关系边列表 (edge_list)”。
+    """
     brics_bonds = list(BRICS.FindBRICSBonds(mol))
     if len(brics_bonds) == 0:
         return [tuple(range(mol.GetNumAtoms()))], []
 
-    
+    # 提取切断的键的 atom indices
     bond_ids = []
     broken_atom_pairs = []
     for (a, b), _labels in brics_bonds:
@@ -94,39 +106,43 @@ def brics_fragment_atom_indices(mol):
     if len(bond_ids) == 0:
         return [tuple(range(mol.GetNumAtoms()))], []
 
-    
+    # 进行切分
     frag_mol = Chem.FragmentOnBonds(mol, bond_ids, addDummies=False)
     frags = Chem.GetMolFrags(frag_mol, asMols=False, sanitizeFrags=False)
 
-    
+    # 构建 原子ID -> 片段ID 的映射字典，用于找回片段间的连接关系
     atom2frag = {}
     for frag_idx, atom_indices in enumerate(frags):
         for a_idx in atom_indices:
             atom2frag[a_idx] = frag_idx
 
-    
+    # 构建真实的片段级别连接边 (Frag_i, Frag_j)
     frag_edges = []
     for a, b, bond_type in broken_atom_pairs:
         f_a = atom2frag.get(a)
         f_b = atom2frag.get(b)
         if f_a is not None and f_b is not None and f_a != f_b:
             frag_edges.append((f_a, f_b, bond_type))
-            frag_edges.append((f_b, f_a, bond_type))  
+            frag_edges.append((f_b, f_a, bond_type))  # 无向图，双向添加
 
-    
+    # 去重
     frag_edges = list(set(frag_edges))
 
     return list(frags), frag_edges
 
 
 def build_ligand_mol_from_sample(sample):
-    'Construct an RDKit molecule from ligand tensors.'
+    """
+    用 LMDB 的 ligand_element + ligand_bond_index/bond_type + ligand_pos
+    组一个 RDKit Mol（带 conformer）
+    [Fix] 强制计算 RingInfo 以避免 BRICS 报错
+    """
     elems = np.asarray(sample['ligand_element'])
     pos = np.asarray(sample['ligand_pos'], dtype=np.float32)
     bond_index = np.asarray(sample['ligand_bond_index'])
     bond_type = np.asarray(sample['ligand_bond_type'])
 
-    
+    # bond_index 可能是 [2, B] 或 [B, 2]
     if bond_index.ndim == 2 and bond_index.shape[0] == 2:
         bonds = bond_index.T
     else:
@@ -143,7 +159,7 @@ def build_ligand_mol_from_sample(sample):
         b = int(b)
         if a == b:
             continue
-        
+        # 避免重复添加
         if rw.GetBondBetweenAtoms(a, b) is None:
             rw.AddBond(a, b, bt)
 
@@ -156,33 +172,36 @@ def build_ligand_mol_from_sample(sample):
         conf.SetAtomPosition(i, (float(x), float(y), float(z)))
     mol.AddConformer(conf, assignId=True)
 
-    
+    # --- 核心修复开始 ---
     try:
-        
+        # 1. 尝试标准化 (Sanitize)
         Chem.SanitizeMol(mol)
     except Exception:
-        
+        # 如果标准化失败，不要直接 pass，尝试手动修复基础属性
         try:
             mol.UpdatePropertyCache(strict=False)
         except:
-            return None  
+            return None  # 实在没救了，返回 None (dataloader 会跳过)
 
-    
-    
+    # 2. 【关键】强制计算环信息 (RingInfo)
+    # BRICS 算法强依赖于此，否则会报 Pre-condition Violation
     try:
         Chem.GetSymmSSSR(mol)
     except:
-        return None  
-    
+        return None  # 无法计算环，跳过
+    # --- 核心修复结束 ---
 
     return mol
 
 
 # =========================================================
-
+# Utils: 刚体变换与 Kabsch 算法 (参考 FrameDiff 核心逻辑)
 # =========================================================
 def compute_rigid_transform(positions: torch.Tensor):
-    'Estimate a stable local rigid frame from coordinates.'
+    """
+    positions:[M,3] -> center[3], rot[3,3]
+    用协方差 SVD/PCA 得一个稳定的刚体朝向（右手系）
+    """
     device, dtype = positions.device, positions.dtype
     if positions.size(0) < 3:
         center = positions.mean(dim=0)
@@ -202,31 +221,34 @@ def compute_rigid_transform(positions: torch.Tensor):
 
 
 def kabsch_alignment(real_pts: torch.Tensor, ideal_pts: torch.Tensor):
-    'Align reference coordinates to target coordinates with Kabsch.'
+    """
+    实现 Kabsch 算法：计算旋转矩阵 R 和平移向量 t，使得 R @ ideal + t 接近 real
+    符合论文 3.3 节的 Rigid-Fragment 还原思路
+    """
     mu_real = real_pts.mean(dim=0)
     mu_ideal = ideal_pts.mean(dim=0)
 
     real_c = real_pts - mu_real
     ideal_c = ideal_pts - mu_ideal
 
-    
+    # 计算协方差矩阵
     H = ideal_c.t() @ real_c
     U, S, Vh = torch.linalg.svd(H)
 
-    
+    # 计算旋转矩阵 R
     R = Vh.t() @ U.t()
 
-    
+    # 修正反射，确保 det(R) = 1
     if torch.linalg.det(R) < 0:
         Vh_mod = Vh.clone()
         Vh_mod[2, :] *= -1
         R = Vh_mod.t() @ U.t()
 
-    return mu_real, R  
+    return mu_real, R  # mu_real 即为平移向量 t
 
 
 def _build_frames(pos, rot):
-    'Compose homogeneous transforms from rotations and translations.'
+    """ 将 R 和 t 合并为 [N, 4, 4] 变换矩阵 """
     N = pos.shape[0]
     frames = torch.eye(4).repeat(N, 1, 1).to(pos.device)
     frames[:, :3, :3] = rot
@@ -310,7 +332,7 @@ def _filter_valid_lmdb_keys(env, target_keys, split, found_split, strict_split=F
 
 
 # =========================================================
-
+# PDBbindDataset: 刚体片段级重构
 # =========================================================
 
 class PDBbindDataset(Dataset):
@@ -324,7 +346,7 @@ class PDBbindDataset(Dataset):
         self.fragment_vocab = ensure_fragment_vocabulary(data_path, prefix)
         prefix_lower = prefix.lower()
 
-        
+        # 1. 定位 LMDB。CrossDock 与 PDBbind 不允许互相静默回退。
         prefix_lower = prefix.lower()
         if "crossdock" in prefix_lower:
             raise ValueError("Use CrossDockDataset for CrossDock prefixes.")
@@ -344,7 +366,7 @@ class PDBbindDataset(Dataset):
         self.env = lmdb.open(lmdb_path, subdir=False, readonly=True, lock=False, readahead=False, meminit=False,
                              max_readers=256)
 
-        
+        # 2. 加载 Split 并验证 Key
         if "pdbbind" in prefix_lower:
             possible_split = [
                 os.path.join(data_path, f"{prefix}_split.pt"),
@@ -364,7 +386,7 @@ class PDBbindDataset(Dataset):
                 found_split = True
                 break
 
-        
+        # 3. 过滤不存在的 Key (修复 KeyError)
         print(f"🔍 Verifying {len(target_keys)} keys for '{split}'...")
         self.valid_keys = []
         with self.env.begin(write=False) as txn:
@@ -383,7 +405,7 @@ class PDBbindDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        
+        # 1. 基础加载逻辑 (带跳过机制)
         max_attempts = 1 if self.strict_identity else 100
         requested_key = self.valid_keys[idx]
         last_error = None
@@ -399,15 +421,15 @@ class PDBbindDataset(Dataset):
                 if getattr(self, 'pocket_only', False):
                     return self._build_pocket_only_item(sample, key, current_idx)
 
-                
-                
+                # 2. 【核心修复】在线生成片段信息
+                # 既然数据里没有 'fragments'，我们现场根据原子和化学键构建 RDKit 分子并切分
                 from src.datasets import build_ligand_mol_from_sample, brics_fragment_atom_indices
 
                 mol = build_ligand_mol_from_sample(sample)
                 if mol is None:
                     continue
 
-                
+                # 使用 BRICS 算法切分原子索引
                 rigid_frags, frag_edges, attachment_edges = fragment_graph_to_rigid_tensors(
                     mol,
                     self.fragment_vocab,
@@ -425,10 +447,10 @@ class PDBbindDataset(Dataset):
                     true_attach_src[u, v] = int(attach_u)
                     true_attach_dst[u, v] = int(attach_v)
 
-                
+                # 3. 基础信息提取
                 ligand_pos = torch.tensor(sample['ligand_pos'], dtype=const.TORCH_FLOAT)
-                
-                
+                # 此时我们没有 residue_names，为了对齐论文 22 类词表，
+                # 我们暂时将所有切出来的片段映射为 'UNK' (ID: 20)，除非你的数据能提供残基名
 
                 frag_centers, frag_rots, frag_types, frag_type_ids = [], [], [], []
 
@@ -438,15 +460,15 @@ class PDBbindDataset(Dataset):
                     frag_rots.append(fragment_info["rotation"])
                     frag_type_ids.append(type_idx)
 
-                    
+                    # 默认设为 UNK (符合 22 类定义中的第 20 位)
                     one_hot = np.zeros(const.GEOM_NUMBER_OF_FRAGMENT_TYPES, dtype=np.float32)
                     one_hot[type_idx] = 1.0
 
-                    
-                    
+                    # 由于是通用配体切分，原子名可能对不上主链模板
+                    # 此时 Kabsch 无法工作，直接走质心兜底逻辑
                     frag_types.append(one_hot)
 
-                
+                # 4. 封装返回
                 pocket_frames = self._get_pocket_frames(sample)
                 n_pocket = pocket_frames.shape[0]
                 protein_element = torch.as_tensor(
@@ -517,7 +539,7 @@ class PDBbindDataset(Dataset):
 
             except Exception as e:
                 last_error = e
-                
+                # print(f"⚠️ 样本 {key} 片段化失败: {e}")
                 continue
 
         key_text = requested_key.decode() if isinstance(requested_key, bytes) else str(requested_key)
@@ -596,7 +618,7 @@ class PDBbindDataset(Dataset):
         }
 
     def _get_pocket_frames(self, sample):
-        
+        # 简化版：直接将蛋白原子位置转为单位旋转的 Frames
         prot_pos = torch.tensor(sample['protein_pos'][:MAX_POCKET_ATOMS], dtype=const.TORCH_FLOAT)
         frames = torch.eye(4).repeat(prot_pos.shape[0], 1, 1)
         frames[:, :3, 3] = prot_pos
@@ -667,7 +689,7 @@ class MOADDataset(Dataset):
             return
 
         self.prefix = prefix
-        
+        # 自动识别 pocket 模式（如 4A, 6A 等）
         if '.' in prefix:
             prefix_base, pocket_mode = prefix.split('.')
         else:
@@ -688,19 +710,21 @@ class MOADDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, item):
-        
+        # 兼容字典格式和列表格式
         if isinstance(self.data, dict):
-            
+            # 尝试根据前缀获取对应的 split (train/val/test)
             for key in ['train', 'val', 'test']:
                 if key in self.prefix and key in self.data:
                     return self.data[key][item]
-            
+            # 兜底返回第一个可用列表
             return next(iter(self.data.values()))[item]
         return self.data[item]
 
     @staticmethod
     def preprocess(data_path, prefix, device):
-        'Convert a MOAD complex into rigid-fragment features.'
+        """
+        MOAD 预处理：将全原子 PDB 映射为 22 类刚体片段
+        """
         lmdb_path = os.path.join(data_path, f'{prefix}.lmdb')
         if not os.path.exists(lmdb_path):
             raise FileNotFoundError(f"LMDB not found at: {lmdb_path}")
@@ -716,7 +740,7 @@ class MOADDataset(Dataset):
                 sample = pickle.loads(value)
 
                 try:
-                    
+                    # 1. 蛋白质口袋处理 (Rigid Frames)
                     protein_pos = np.asarray(sample['protein_pos'], dtype=np.float32)
                     if protein_pos.shape[0] > MAX_POCKET_ATOMS:
                         protein_pos = protein_pos[:MAX_POCKET_ATOMS]
@@ -724,12 +748,12 @@ class MOADDataset(Dataset):
                     pocket_pos = torch.as_tensor(protein_pos, dtype=const.TORCH_FLOAT)
                     n_pocket = pocket_pos.size(0)
 
-                    
+                    # 口袋使用单位旋转矩阵作为初始 Frame
                     pocket_rot = torch.eye(3).view(1, 3, 3).repeat(n_pocket, 1, 1)
                     pocket_frames = _build_frames_from_pos_rot(pocket_pos, pocket_rot)
                     pocket_mask = torch.ones(n_pocket, dtype=const.TORCH_FLOAT).to(device)
 
-                    
+                    # 2. 配体片段化处理 (BRICS -> Rigid Nodes)
                     mol = build_ligand_mol_from_sample(sample)
                     if mol is None:
                         continue
@@ -800,7 +824,7 @@ class MOADDataset(Dataset):
 
                     if len(frags) > MAX_FRAG_NODES:
                         frags = frags[:MAX_FRAG_NODES]
-                        
+                        # 列表推导式：只保留 u 和 v 都在安全索引范围内的边
                         frag_edges = [(u, v) for u, v in frag_edges if u < MAX_FRAG_NODES and v < MAX_FRAG_NODES]
 
                     ligand_pos_all = torch.tensor(sample['ligand_pos'], dtype=const.TORCH_FLOAT)
@@ -813,17 +837,17 @@ class MOADDataset(Dataset):
                         atom_ids = list(atom_ids)
                         pts = ligand_pos_all[atom_ids]
 
-                        
+                        # 获取论文定义的 22 类 ID
                         aa_name = res_names[f_idx] if f_idx < len(res_names) else 'ALA'
                         aa_type_id = const.AA2NUM.get(aa_name, const.AA2NUM['UNK'])
 
-                        
+                        # Kabsch 对齐以获得精确的 R, t
                         ideal_info = const.IDEAL_COORDS[aa_type_id]
                         name2idx = const.AA_NAME2IDX[aa_type_id]
 
                         real_subset, ideal_subset = [], []
                         for global_idx in atom_ids:
-                            
+                            # 尝试匹配原子名称以提高对齐精度
                             name = atom_names[global_idx] if global_idx < len(atom_names) else ""
                             if name in name2idx:
                                 real_subset.append(ligand_pos_all[global_idx])
@@ -832,19 +856,19 @@ class MOADDataset(Dataset):
                         if len(real_subset) >= 3:
                             t, R = kabsch_alignment(torch.stack(real_subset), torch.stack(ideal_subset))
                         else:
-                            
+                            # 兜底：质心 + 单位阵
                             t = pts.mean(dim=0)
                             R = torch.eye(3)
 
                         frag_centers.append(t)
                         frag_rots.append(R)
 
-                        
+                        # 构造 22 维 One-hot (对齐 PDBbind 和模型输入)
                         oh = np.zeros(const.GEOM_NUMBER_OF_FRAGMENT_TYPES)
                         oh[aa_type_id] = 1.0
                         frag_types.append(oh)
 
-                    
+                    # 3. 封装样本
                     n_frag = len(frag_centers)
                     if n_frag == 0: continue
                     true_bonds = torch.zeros((n_frag, n_frag), dtype=torch.long)
@@ -853,14 +877,14 @@ class MOADDataset(Dataset):
 
                     item = {
                         'uuid': key.decode() if isinstance(key, bytes) else str(key),
-                        'num_atoms': n_frag,  
+                        'num_atoms': n_frag,  # 在片段级，节点数就是 num_atoms
                         'positions': torch.stack(frag_centers),
                         'frag_rotations': torch.stack(frag_rots),
                         'one_hot': torch.tensor(np.stack(frag_types), dtype=const.TORCH_FLOAT),
                         'charges': torch.zeros(n_frag),
                         'anchors': torch.zeros(n_frag),
-                        'fragment_mask': torch.ones(n_frag),  
-                        'linker_mask': torch.zeros(n_frag),  
+                        'fragment_mask': torch.ones(n_frag),  # MOAD 评估通常作为整体生成
+                        'linker_mask': torch.zeros(n_frag),  # 只有在特定的 Inpainting 任务中才设为 1
                         'pocket_frames': pocket_frames,
                         'pocket_mask': pocket_mask,
                         'true_bonds': true_bonds
@@ -868,7 +892,7 @@ class MOADDataset(Dataset):
                     data.append(item)
 
                 except Exception as e:
-                    
+                    # 跳过损坏的样本
                     continue
 
         env.close()
@@ -969,7 +993,7 @@ class ZincDataset(Dataset):
         return data
 
 def _pad_edge_matrix(m: torch.Tensor, max_len: int, fill_value: int = 0):
-    'Pad a square edge matrix to the requested size.'
+    """将 [N, N] 的边矩阵 Padding 到 [max_len, max_len]"""
     n = m.size(0)
     out = m.new_full((max_len, max_len), fill_value)
     out[:n, :n] = m
@@ -997,7 +1021,7 @@ def _fit_1d(t: torch.Tensor, target_len: int, device=None, dtype=None, fill_valu
     return out
 
 # =========================================================
-
+# Collate: 适配 FrameDiff 的 batch 组织形式
 # =========================================================
 
 def collate_with_fragment_edges(batch_list):
@@ -1017,7 +1041,7 @@ def collate_with_fragment_edges(batch_list):
         padded_mask = torch.cat([curr_mask, torch.zeros(max_lig - curr_mask.shape[0], device=curr_mask.device)])
         lig_fmask.append(padded_mask)
 
-        
+        # ✅ 对 true_bonds 进行二维 Padding
         if 'true_bonds' in s:
             lig_bonds.append(_pad_edge_matrix(s['true_bonds'], max_lig))
 
@@ -1028,7 +1052,7 @@ def collate_with_fragment_edges(batch_list):
         'fragment_mask': torch.stack(lig_fmask).unsqueeze(-1),  # [B, max_lig, 1]
     }
 
-    
+    # ✅ 如果包含拓扑信息，打包输出
     if len(lig_bonds) > 0:
         out['true_bonds'] = torch.stack(lig_bonds)  # [B, max_lig, max_lig]
 
@@ -1220,10 +1244,10 @@ def collate_with_fragment_edges(batch_list):
 def get_dataloader(
         dataset,
         batch_size,
-        collate_fn=collate_with_fragment_edges,  
+        collate_fn=collate_with_fragment_edges,  # 默认使用符合论文思路的刚体批处理
         shuffle=False,
-        num_workers=0,  
-        pin_memory=False  
+        num_workers=0,  # 默认改回 0：彻底解决多进程读取 LMDB 的 EOFError 和编码报错
+        pin_memory=False  # 默认设为 False：解决 Pin memory thread exited 报错
 ):
 
     num_workers = 0
@@ -1237,6 +1261,6 @@ def get_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
 
-        persistent_workers=False,  
+        persistent_workers=False,  # 单进程不支持 persistent_workers
         prefetch_factor=None
     )
