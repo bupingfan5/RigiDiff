@@ -1,0 +1,4 @@
+target_id,pdb_id,chain,protein_target,disease,native_ligand,known_key_residues,disease_score,structure_score,residue_evidence_score,metadata_source,notes
+48,2OQV,A,DPP4,Type 2 diabetes,MA9,ARG125;GLU205;GLU206;PHE357;TYR547;SER630;TYR631;VAL656;TRP659;TYR662;TYR666;ASP708;ASN710;HIS740,1.0,1.0,1.0,https://www.rcsb.org/structure/2OQV,Primary case; CrossDocked reference is ligand 524 from PDB 2QT9
+16,2X23,A,InhA,Tuberculosis,TCU;NAD,PHE149;TYR158;ALA198;MET199;ILE202;VAL203,1.0,1.0,1.0,https://www.rcsb.org/structure/2X23,Alternative case
+4,5C9C,A,BRAF(V600E),BRAF(V600E)-mutant cancer,4Z5,GLU501;ASP594,1.0,1.0,0.8,https://www.rcsb.org/structure/5C9C,Alternative case; disease label should remain broad unless a specific indication is cited
