@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -16,7 +17,7 @@ from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import Crippen, Descriptors, Lipinski, QED, rdFingerprintGenerator, rdMolDescriptors
 
 
-CASE_ROOT = Path(__file__).resolve().parents[1]
+CASE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = CASE_ROOT.parent
 MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 RDLogger.DisableLog("rdApp.warning")
@@ -29,17 +30,56 @@ except Exception:
     sascorer = None
 
 
+def resolve_project_path(value: str | Path, root: Path) -> Path:
+    """Resolve relative paths at the repository root and translate drive paths."""
+    text = str(value).replace("\\", "/")
+    drive = re.match(r"^([A-Za-z]):/(.*)$", text)
+    if drive and os.name != "nt":
+        text = f"/mnt/{drive.group(1).lower()}/{drive.group(2)}"
+    elif os.name == "nt":
+        mounted = re.match(r"^/mnt/([A-Za-z])/(.*)$", text)
+        if mounted:
+            text = f"{mounted.group(1).upper()}:/{mounted.group(2)}"
+    path = Path(text)
+    return path if path.is_absolute() else root / path
+
+
 def load_config() -> dict:
     path = CASE_ROOT / "config.json"
     config = json.loads(path.read_text(encoding="utf-8"))
-    root = Path(config.get("project_root", PROJECT_ROOT)).resolve()
+    root = resolve_project_path(config.get("project_root", "."), PROJECT_ROOT).resolve()
     config["project_root"] = root
     return config
 
 
 def project_path(config: dict, key: str) -> Path:
-    value = Path(config[key])
-    return value if value.is_absolute() else config["project_root"] / value
+    return resolve_project_path(config[key], Path(config["project_root"]))
+
+
+def executable_path(config: dict, key: str) -> Path:
+    value = str(config[key])
+    executable = shutil.which(value)
+    if executable:
+        return Path(executable)
+    path = project_path(config, key)
+    if path.is_file():
+        return path
+    raise FileNotFoundError(
+        f"Executable '{value}' not found for '{key}'. Activate the environment "
+        "containing the tool or set its path in case_study/config.json."
+    )
+
+
+def prepared_protein_path(config: dict, recorded_path: str) -> Path:
+    # Prefer the explicitly configured experiment, not an archived machine path.
+    name = Path(str(recorded_path).replace("\\", "/")).name
+    path = project_path(config, "vina_work_dir") / "prepared_receptors" / name
+    if not name or not path.is_file():
+        raise FileNotFoundError(
+            f"Prepared receptor not found in the configured docking run: {path}. "
+            "Copy the complete matching vina_work_dir, not just its result CSV."
+        )
+    return path
 
 
 def parse_bool(value) -> bool:
@@ -251,7 +291,14 @@ def rank_percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Seri
 
 
 def load_vina(config: dict) -> pd.DataFrame:
-    frame = pd.read_csv(project_path(config, "vina_csv"), low_memory=False)
+    path = project_path(config, "vina_csv")
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"New-experiment Vina CSV not found: {path}. Set 'vina_csv' and "
+            "'vina_work_dir' in case_study/config.json to the matching seed-3407 "
+            "outputs. No older experiment is loaded automatically."
+        )
+    frame = pd.read_csv(path, low_memory=False)
     frame["target_id"] = numeric(frame["target_id"]).astype("Int64")
     frame["vina"] = numeric(frame["full_protein_vina_score"])
     for column in ("qed", "sa", "logp", "mw", "vdw_overlap_max", "minimum_relative_distance"):

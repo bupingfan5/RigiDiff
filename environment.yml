@@ -1,4 +1,4 @@
-name: fragdiff
+name: RigiDiff
 channels:
   - conda-forge
   - anaconda

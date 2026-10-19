@@ -16,6 +16,7 @@ from case_utils import (
     load_config,
     load_vina,
     project_path,
+    prepared_protein_path,
     sample_stem,
 )
 
@@ -45,7 +46,7 @@ def prepare_target(target_id: int) -> Path:
     pocket = project_path(config, "data_root") / pocket_rel
     reference = crossdocked_reference_path(config, pocket_rel)
     full_protein = project_path(config, "data_root") / Path(pocket_rel).parent / f"{first['pdb_id']}_full.pdb"
-    prepared_protein = Path(str(first["prepared_protein_filename"]).replace("/mnt/e/fragdiff1/fragdiff", str(config["project_root"])))
+    prepared_protein = prepared_protein_path(config, first["prepared_protein_filename"])
 
     for source, name in (
         (pocket, "pocket.pdb"),

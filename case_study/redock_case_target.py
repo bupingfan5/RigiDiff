@@ -13,6 +13,7 @@ import pandas as pd
 from case_utils import (
     CASE_ROOT,
     convert_pdbqt_to_sdf,
+    executable_path,
     load_config,
     project_path,
     read_first_sdf,
@@ -75,7 +76,7 @@ def main():
         receptor.unlink(missing_ok=True)
     if not receptor.exists():
         command = [
-            str(Path(config["obabel"])),
+            str(executable_path(config, "obabel")),
             str(directory / "reference" / "pocket.pdb"),
             "-O",
             str(receptor),
@@ -94,12 +95,10 @@ def main():
             raise RuntimeError(
                 f"Pocket receptor preparation failed; see {receptor_log}"
             )
-    vina = project_path(config, "vina_executable")
-    if not vina.exists():
-        raise FileNotFoundError(
-            f"AutoDock Vina executable is missing: {vina}. "
-            "Download the official v1.2.3 Windows binary as documented in README.md."
-        )
+    vina = executable_path(config, "vina_executable")
+    vina_version = subprocess.run(
+        [str(vina), "--version"], capture_output=True, text=True, check=True
+    ).stdout.strip()
 
     def dock(row: dict) -> dict:
         stem = row["stem"]
@@ -191,7 +190,7 @@ def main():
         "seed": int(config["local_docking_seed"]),
         "exhaustiveness": int(config["local_docking_exhaustiveness"]),
         "num_modes": int(config["local_docking_num_modes"]),
-        "vina_version": "1.2.3",
+        "vina_version": vina_version,
         "purpose": (
             "Case-study-only local redocking against the exact cropped pocket "
             "provided to the generation model. Main-table full-protein scores "
