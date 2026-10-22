@@ -1,0 +1,4 @@
+checkpoints/** filter=lfs diff=lfs merge=lfs -text
+samples/** filter=lfs diff=lfs merge=lfs -text
+data/crossdocked_pocket10_test99_v2.lmdb filter=lfs diff=lfs merge=lfs -text
+data/crossdocked_pocket10_test99_val1000_fixed_split.pt filter=lfs diff=lfs merge=lfs -text
