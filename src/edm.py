@@ -16,17 +16,17 @@ from src.pocket_geometry import (
 
 class ValueNetworkGuidance:
     """
-    价值网络梯度引导包装类
+    Wrapper for value-network gradient guidance.
 
-    在采样过程中应用梯度引导：ε̂ = ε - λ∇_{X_t}V_φ
+    Apply gradient guidance during sampling: epsilon_hat = epsilon - lambda * grad_X_t V_phi.
     """
     def __init__(self, value_net, guidance_scale=0.4, start_step=50, end_step=700, max_norm=1.0):
         """
         Args:
-            value_net: 训练好的价值网络模型
-            guidance_scale: 引导强度 λ
-            start_step: 开始应用引导的时间步
-            end_step: 停止应用引导的时间步
+            value_net: Trained value network.
+            guidance_scale: Guidance strength lambda.
+            start_step: First timestep at which guidance is applied.
+            end_step: Timestep at which guidance stops.
         """
         self.value_net = value_net
         self.guidance_scale = guidance_scale
@@ -37,33 +37,33 @@ class ValueNetworkGuidance:
 
     def __call__(self, x, rot, h, t, pred_eps_x, node_mask, edge_index):
         """
-        应用价值网络梯度引导
+        Apply value-network gradient guidance.
 
         Args:
-            x: [B, N, 3] 当前位置
-            rot: [B, N, 3, 3] 当前旋转
-            h: [B, N, F] 节点特征
-            t: [B] 当前时间步
-            pred_eps_x: [B, N, 3] 网络预测的噪声
-            node_mask: [B, N, 1] 节点掩码
-            edge_index: [2, E] 边索引
+            x: [B, N, 3] Current positions.
+            rot: [B, N, 3, 3] Current rotations.
+            h: [B, N, F] Node features.
+            t: [B] Current timestep.
+            pred_eps_x: [B, N, 3] Network-predicted noise.
+            node_mask: [B, N, 1] Node mask.
+            edge_index: [2, E] Edge indices.
 
         Returns:
-            guided_eps_x: [B, N, 3] 引导后的噪声预测
+            guided_eps_x: [B, N, 3] Guided noise prediction.
         """
-        # 检查是否在引导范围内
+        # Check whether the current step is within the guidance window.
         t_val = t[0].item() if isinstance(t, torch.Tensor) else t
         if t_val < self.start_step or t_val > self.end_step:
             self.last_delta_norm = 0.0
             return pred_eps_x
 
-        # 启用梯度计算
+        # Enable gradient computation.
         x_guided = x.detach().clone().requires_grad_(True)
 
-        # 计算价值函数
+        # Compute the value function.
         value = self.value_net(x_guided, rot, h, t, node_mask, edge_index)
 
-        # 计算梯度 ∇_{X_t}V_φ
+        # Compute the gradient grad_X_t V_phi.
         grad_value = torch.autograd.grad(
             outputs=value.sum(),
             inputs=x_guided,
@@ -72,7 +72,7 @@ class ValueNetworkGuidance:
             allow_unused=True
         )[0]
 
-        # 应用引导：ε̂ = ε - λ∇_{X_t}V_φ
+        # Apply guidance: epsilon_hat = epsilon - lambda * grad_X_t V_phi.
         if grad_value is None:
             grad_value = torch.zeros_like(x_guided)
         grad_value = torch.nan_to_num(grad_value, nan=0.0, posinf=0.0, neginf=0.0)
@@ -451,14 +451,14 @@ class EDM(nn.Module):
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(bs, 1, 1)
         sqrt_sigma = self.sqrt_one_minus_alphas_cumprod[t].view(bs, 1, 1)
 
-        # 1. 位置扩散 (Euclidean)
+        # 1. Position diffusion (Euclidean).
         eps_x = torch.randn_like(x)
         z_x = sqrt_alpha * x + sqrt_sigma * eps_x
 
-        # 2. 旋转扩散 (SO3): 使用独立的 rot_sigmas，与坐标 schedule 解耦
+        # 2. Rotation diffusion (SO3): use independent rot_sigmas, decoupled from the coordinate schedule.
         z_rot, eps_rot = isotropic_gaussian_so3(rot, t, self.rot_sigmas)
 
-        # 3. 化学键扩散 (Discrete Markov Chain): 使用 bond_alphas_cumprod
+        # 3. Bond diffusion (Discrete Markov Chain): use bond_alphas_cumprod.
         z_bond = None
         if true_bonds is not None:
             num_bond_classes = 5  # 0:none, 1:single, 2:double, 3:triple, 4:aromatic
@@ -478,7 +478,7 @@ class EDM(nn.Module):
             h_t = F.one_hot(z_type, num_classes=num_type_classes).to(dtype=h.dtype)
             h_t = h_t * node_mask
 
-        # 4. 网络联合预测
+        # 4. Joint network prediction.
         (
             pred_eps_x,
             pred_eps_rot,
@@ -496,19 +496,19 @@ class EDM(nn.Module):
             pocket_aa_type=pocket_aa_type,
             pocket_is_backbone=pocket_is_backbone,
             linker_mask=linker_mask,
-            bond_state=z_bond  # 传递噪声化学键状态
+            bond_state=z_bond  # Pass the noisy bond states.
         )
 
         weight = (linker_mask * node_mask).squeeze(-1)
         loss_x = (pred_eps_x.float() - eps_x.float()).pow(2).sum(dim=-1)
         loss_x = (loss_x * weight).sum() / (weight.sum() + 1e-8)
 
-        # 旋转 Loss: 在切空间（Angle-axis）计算 MSE
+        # Rotation loss: compute MSE in the tangent space (angle-axis).
         loss_rot = (pred_eps_rot.float() - eps_rot.float()).pow(2).sum(dim=-1)
         loss_rot = (loss_rot * weight).sum() / (weight.sum() + 1e-8)
 
-        # 1. 反推去噪后模型心目中的“干净坐标” pred_x0
-        # 根据公式：z_x = sqrt_alpha * x0 + sqrt_sigma * eps_x
+        # 1. Recover the predicted clean coordinates pred_x0.
+        # Use the relation: z_x = sqrt_alpha * x0 + sqrt_sigma * eps_x.
         # Auxiliary x0 geometry is evaluated in FP32. Near the end of the
         # diffusion schedule, division by sqrt(alpha_bar) can overflow FP16.
         pred_x0 = (
@@ -532,17 +532,17 @@ class EDM(nn.Module):
             neginf=-1.0,
         ).clamp(min=-1.0, max=1.0)
 
-        # 2. 计算预测的节点(片段质心)间的两两距离平方
+        # 2. Compute squared pairwise distances between predicted nodes (fragment centers).
         dist_sq = torch.sum(
             (pred_x0_aux.unsqueeze(1) - pred_x0_aux.unsqueeze(2)) ** 2,
             dim=-1,
         )
 
-        # 3. 构造有效节点的 2D Mask (只让参与生成的节点互相排斥)
+        # 3. Build a 2D mask for valid nodes so only generated nodes repel one another.
         dist = torch.sqrt(dist_sq + 1e-8)
         mask_2d = weight.unsqueeze(1) * weight.unsqueeze(2)
-        mask_2d.diagonal(dim1=1, dim2=2).fill_(0)  # 自己不跟自己算排斥
-        # 核心：引入化学键交叉熵 (Cross Entropy) 与 几何引导损失 (GFLoss)
+        mask_2d.diagonal(dim1=1, dim2=2).fill_(0)  # Exclude self-repulsion.
+        # Introduce bond cross-entropy and geometry-guidance loss (GFLoss).
         # =====================================================================
         loss_bond = torch.tensor(0.0, device=device)
         loss_gf = torch.tensor(0.0, device=device)
@@ -561,7 +561,7 @@ class EDM(nn.Module):
                 loss_type = F.cross_entropy(valid_type_logits, valid_type_true)
 
         if true_bonds is not None:
-            # A. 拓扑分类损失 (Cross Entropy)
+            # A. Topology classification loss (cross-entropy).
             upper_triangle = torch.triu(
                 torch.ones(n_nodes, n_nodes, dtype=torch.bool, device=device),
                 diagonal=1,
@@ -607,7 +607,7 @@ class EDM(nn.Module):
                 bond_recall = true_positive / true_edge.sum().clamp_min(1).float()
                 predicted_no_bond_rate = (~predicted_edge).float().mean()
 
-            # C. 智能排斥力 (只对预测“无键”的原子生效，防止鸟巢重叠)
+            # C. Apply repulsion only to pairs predicted as nonbonded to prevent overlap.
         safe_dist_sq = 3.6 ** 2
         no_bond_probs = torch.softmax(pred_bonds_logits.float(), dim=-1)[..., 0] if true_bonds is not None else 1.0
         repulsive_energy = torch.relu(safe_dist_sq - dist_sq) * mask_2d * no_bond_probs
@@ -682,7 +682,7 @@ class EDM(nn.Module):
                 sample_weight=sqrt_alpha.reshape(bs),
             )
 
-        # 💥 联合多模态损失函数 (Weights 可调)
+        # Joint multimodal loss with adjustable weights.
         lambda_bond = 1.0
         lambda_type = 1.0
         clash_weight = float(kwargs.get("clash_weight", 1.0))
@@ -1022,7 +1022,7 @@ class EDM(nn.Module):
         return result
 
     def _build_edge_index(self, bs, n_nodes, device):
-        """构建全连接边索引（用于价值网络）"""
+        """Build fully connected edge indices for the value network."""
         rows, cols = [], []
         for b in range(bs):
             for i in range(n_nodes):

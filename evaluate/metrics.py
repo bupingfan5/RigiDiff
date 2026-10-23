@@ -16,7 +16,7 @@ if PROJECT_ROOT not in sys.path:
 
 RDLogger.DisableLog("rdApp.*")
 
-# 引入合成可及性打分
+# Import synthetic accessibility scoring.
 try:
     from src import sascorer
 except ImportError:
@@ -25,8 +25,8 @@ except ImportError:
 
 def calculate_sa_score(mol):
     """
-    DiffGui 论文评估口径的 SA：将原始 Ertl SA Score(1~10，越低越好)
-    转换为 0~1 区间的合成可及性指标（越高越好）。
+    SA following the DiffGui evaluation convention: convert the raw Ertl SA Score
+    (1-10, lower is better) to a synthetic accessibility metric in [0, 1] (higher is better).
     """
     if sascorer is None:
         return np.nan
@@ -45,16 +45,16 @@ def calculate_sa_score(mol):
 
 def count_lipinski_rules(mol):
     """
-    计算符合 Lipinski 五规则的条数。
-    为了对齐 TargetDiff / Pocket2Mol 等顶会论文的评测标准，
-    此处加入第5条规则（可旋转键<=10），使满分达到 5.0。
+    Count the satisfied Lipinski rules.
+    To match the evaluation convention used by TargetDiff / Pocket2Mol,
+    include a fifth rule (rotatable bonds <= 10), giving a maximum score of 5.0.
     """
     try:
         mw = Descriptors.MolWt(mol)
         logp = Descriptors.MolLogP(mol)
         hbd = rdMolDescriptors.CalcNumHBD(mol)
         hba = rdMolDescriptors.CalcNumHBA(mol)
-        # 🌟 顶会评测脚本里用来凑满 5 分的潜规则
+        # Include the fifth criterion used in the benchmark evaluation scripts.
         rot_bonds = rdMolDescriptors.CalcNumRotatableBonds(mol)
 
         score = 0
@@ -99,7 +99,7 @@ def extract_pocket_id(file_name):
 
 
 def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
-    # 检查路径
+    # Check the path.
     if not os.path.exists(sdf_dir):
         print(f"[Error] 路径不存在: {sdf_dir}")
         return
@@ -112,7 +112,7 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
     result_indices_by_pocket = defaultdict(list)
 
     # ==========================================
-    # 第一阶段：提取基础理化属性、拓扑信息和 RDKit 拓扑指纹
+    # Stage 1: extract basic physicochemical properties, topology, and RDKit topological fingerprints.
     # ==========================================
     for f in tqdm(sdf_files, desc="1/2 评估基础理化属性", file=sys.stdout):
         file_name = os.path.basename(f)
@@ -127,19 +127,19 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
 
                 Chem.SanitizeMol(mol)
 
-                # 计算 DiffGui 论文口径的 SA：0~1，越高越好
+                # Compute SA using the DiffGui convention: 0-1, higher is better.
                 sa_val = calculate_sa_score(mol)
 
-                # 计算常规药效学指标
+                # Compute standard molecular property metrics.
                 qed_val = QED.qed(mol)
                 lipinski_score = count_lipinski_rules(mol)
                 mw = Descriptors.MolWt(mol)
                 logp = Descriptors.MolLogP(mol)
 
-                # 🌟 新增：统计成环个数
+                # Count rings.
                 num_rings = mol.GetRingInfo().NumRings()
 
-                # 🌟 新增：统计化学键及其类型
+                # Count chemical bonds by type.
                 num_bonds = mol.GetNumBonds()
                 bond_single = 0
                 bond_double = 0
@@ -157,7 +157,7 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
                     elif bt == Chem.rdchem.BondType.AROMATIC:
                         bond_aromatic += 1
 
-                # 使用与 TargetDiff、PMDM 和 GCDM 一致的默认 RDKit 拓扑指纹
+                # Use default RDKit topological fingerprints, consistent with TargetDiff, PMDM, and GCDM.
                 fp = Chem.RDKFingerprint(mol)
                 result_index = len(results)
                 fps_by_pocket[pocket_id].append(fp)
@@ -171,12 +171,12 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
                     "MW": mw,
                     "LogP": logp,
                     "Atoms": mol.GetNumAtoms(),
-                    "Rings": num_rings,  # 新增写入表格
-                    "Total_Bonds": num_bonds,  # 新增写入表格
-                    "Single_Bonds": bond_single,  # 新增写入表格
-                    "Double_Bonds": bond_double,  # 新增写入表格
-                    "Triple_Bonds": bond_triple,  # 新增写入表格
-                    "Aromatic_Bonds": bond_aromatic  # 新增写入表格
+                    "Rings": num_rings,  # Include in the output table.
+                    "Total_Bonds": num_bonds,  # Include in the output table.
+                    "Single_Bonds": bond_single,  # Include in the output table.
+                    "Double_Bonds": bond_double,  # Include in the output table.
+                    "Triple_Bonds": bond_triple,  # Include in the output table.
+                    "Aromatic_Bonds": bond_aromatic  # Include in the output table.
                 })
             except Exception as e:
                 continue
@@ -186,7 +186,7 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
         return
 
     # ==========================================
-    # 第二阶段：逐口袋计算平均两两 Tanimoto 距离并写入表格
+    # Stage 2: compute mean pairwise Tanimoto distance per pocket and write the results to a table.
     # ==========================================
     print("\n[Progress] 2/2 正在计算逐口袋结构多样性 (Diversity)...")
     per_pocket_diversity = {}
@@ -200,12 +200,12 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
         for result_index in result_indices_by_pocket[pocket_id]:
             results[result_index]["Diversity"] = diversity
 
-    # 存入 CSV
+    # Save to CSV.
     df = pd.DataFrame(results)
     df.to_csv(output_csv, index=False)
 
     # ==========================================
-    # 第三阶段：打印终端统计报表
+    # Stage 3: print summary statistics to the terminal.
     # ==========================================
     diversity_values = np.asarray(list(per_pocket_diversity.values()), dtype=float)
     macro_diversity = float(np.mean(diversity_values))
@@ -231,6 +231,6 @@ def evaluate_folder(sdf_dir, output_csv="metrics_standard_sa.csv"):
 
 
 if __name__ == "__main__":
-    # 确保此路径下有你刚才生成的 SDF 文件
+    # Ensure this path contains the generated SDF files.
     SDF_PATH = "samples/final run1/candidates"
     evaluate_folder(SDF_PATH)

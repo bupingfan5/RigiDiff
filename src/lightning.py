@@ -31,7 +31,7 @@ from src.visualizer import save_xyz_file, visualize_chain
 # ==============================================================================
 # ==============================================================================
 def compute_repulsive_force(x, node_mask, r_vdw=1.0, strength=0.1):
-    """【步骤一】计算空间排斥力梯度，防止原子极端堆叠 (0.04埃重合问题)"""
+    """Step 1: compute spatial repulsion gradients to prevent extreme atom overlap (0.04 angstrom separation)."""
     with torch.enable_grad():
         x = x.detach().clone().requires_grad_(True)
         dist_sq = torch.sum((x.unsqueeze(1) - x.unsqueeze(2)) ** 2, dim=-1)
@@ -54,14 +54,14 @@ def compute_repulsive_force(x, node_mask, r_vdw=1.0, strength=0.1):
 
 
 def prevent_z_collapse(x, node_mask, eps=1e-2):
-    """【步骤二】检测并修复维度塌陷 (Z轴方差丢失问题)"""
-    B = x.shape[0]  # 提取 batch size
+    """Step 2: detect and repair dimensional collapse (loss of variance along the Z axis)."""
+    B = x.shape[0]  # Get the batch size.
     x_out = x.clone()
     for b in range(B):
         valid_mask = node_mask[b].squeeze(-1) > 0.5
         valid_x = x_out[b][valid_mask]
 
-        if valid_x.shape[0] < 3:  #  检查节点数量是否小于3
+        if valid_x.shape[0] < 3:  #  Check whether there are fewer than three nodes.
             continue
 
         var_3d = torch.var(valid_x, dim=0)
@@ -478,11 +478,11 @@ class DDPM(pl.LightningModule):
         try:
             bs = data['positions'].shape[0] if 'positions' in data else 0
 
-            # 判断当前是不是需要打印多行详细信息的 Debug 步
+            # Determine whether this is a debug step requiring detailed multiline output.
             is_debug_step = (self.global_step < 5 or self.global_step % 100 == 0)
 
             # ==============================================================
-            # 1. 打印保留的 DEBUG 块
+            # 1. Print the retained DEBUG block.
             # ==============================================================
             if is_debug_step and 'positions' in data:
                 print(f"\n🚀 [Training] Step {self.global_step} ... Batch={bs}")
@@ -493,7 +493,7 @@ class DDPM(pl.LightningModule):
                     print(f"  pocket_frames: {data['pocket_frames'].shape}")
                 print("----------------------------------")
 
-            # 2. 前向传播计算 Loss
+            # 2. Compute the loss in the forward pass.
             loss, loss_dict = self.forward(data, training=True)
             if not torch.isfinite(loss):
                 bad_metrics = [
@@ -508,7 +508,7 @@ class DDPM(pl.LightningModule):
                 )
 
             # ==============================================================
-            # 3. 终端 Loss 实时输出逻辑
+            # 3. Display the current loss in the terminal.
             # ==============================================================
             loss_total = float(loss_dict.get('loss', 0))
             loss_x = float(loss_dict.get('loss_x', 0))
@@ -522,10 +522,10 @@ class DDPM(pl.LightningModule):
             log_str = f"🚀 [Training] Step {self.global_step:05d} ... Batch={bs} | Tot: {loss_total:.3f} | X: {loss_x:.3f} | Rot: {loss_rot:.3f} | Type: {loss_type:.3f} | Bond: {loss_bond:.3f} | GF: {loss_gf:.3f}     "
 
             if is_debug_step:
-                # 如果刚才打印了 Debug 块，直接换行打印 Loss，防止覆盖 Debug 信息
+                # After a DEBUG block, print the loss on a new line to avoid overwriting debug information.
                 print(log_str)
             else:
-                # 平时的普通步，使用 \r 覆盖当前行，实现原地跑马灯效果，终端极其干净！
+                # For ordinary steps, use a carriage return to update the current terminal line in place.
                 print(f"\r{log_str}", end='', flush=True)
 
             # 4. Accumulate every batch so the logged value is the full-epoch mean.
@@ -724,9 +724,9 @@ class DDPM(pl.LightningModule):
                 current_node_atoms =[]
 
                 for atom_info in template:
-                    raw_name = atom_info[0].strip()  # ✅ 取第一个元素（名字）
+                    raw_name = atom_info[0].strip()  # Take the first element (the name).
                     elem_symbol = "".join([c for c in raw_name if c.isalpha()])
-                    # ✅ 修复不完整的语法
+                    # Fix incomplete syntax.
                     if len(elem_symbol) > 1 and elem_symbol.upper() not in ["CL", "BR"]:
                         elem_symbol = elem_symbol[0]
                     if elem_symbol == 'H': continue

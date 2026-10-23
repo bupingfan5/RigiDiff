@@ -204,9 +204,9 @@ def main(args):
     )
     if 'PDBbind' in args.train_data_prefix or 'MOAD' in args.train_data_prefix or is_crossdock:
         from src.const import GEOM_NUMBER_OF_FRAGMENT_TYPES
-        in_node_nf = GEOM_NUMBER_OF_FRAGMENT_TYPES  # 此时为 22
+        in_node_nf = GEOM_NUMBER_OF_FRAGMENT_TYPES  # Currently 22.
     else:
-        # 保持旧的小分子原子级逻辑
+        # Preserve the legacy atom-level logic for small molecules.
         number_of_atoms = GEOM_NUMBER_OF_ATOM_TYPES if is_geom else NUMBER_OF_ATOM_TYPES
         in_node_nf = number_of_atoms + args.include_charges
     # number_of_atoms = GEOM_NUMBER_OF_ATOM_TYPES if is_geom else NUMBER_OF_ATOM_TYPES
@@ -225,7 +225,7 @@ def main(args):
             f"{args.bond_class_weights}"
         )
 
-    # 在 train_fragdiff.py 中调整
+    # Adjust the settings in train_fragdiff.py.
     ddpm = DDPM(
         data_path=args.data,
         train_data_prefix=args.train_data_prefix,

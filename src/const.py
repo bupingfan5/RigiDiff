@@ -6,8 +6,8 @@ TORCH_INT = torch.long
 # #################################################################################### #
 
 
-# 1. 片段词表定义 
-# 将原有的原子类别替换为刚体片段类别
+# 1. Fragment vocabulary definitions.
+# Replace the original atom categories with rigid-fragment categories.
 NUM2AA = [
     'ALA','ARG','ASN','ASP','CYS',
     'GLN','GLU','GLY','HIS','ILE',
@@ -17,11 +17,11 @@ NUM2AA = [
 ]
 AA2NUM = {x: i for i, x in enumerate(NUM2AA)}
 
-# 片段类别总数 (K)，这将决定你 DDPM 模型的 num_classes
+# Total number of fragment classes (K), determining num_classes in the DDPM model.
 GEOM_NUMBER_OF_FRAGMENT_TYPES = len(NUM2AA)
 
-# 2. 片段模板库 
-# 存储每个片段在局部坐标系下的原子相对位置，用于原子级还原
+# 2. Fragment template library.
+# Store local-frame atom positions for each fragment to support atom-level reconstruction.
 IDEAL_COORDS = [
     [ # 0 ala
         [' N  ', 0, (-0.5272, 1.3593, 0.000)],
@@ -413,8 +413,8 @@ IDEAL_COORDS = [
     ],
 ]
 
-# 3. 构建约束拓扑 
-# 定义片段内部的连接关系，用于解码时的化学验证
+# 3. Construct constrained topology.
+# Define intra-fragment connectivity for chemical validation during decoding.
 AA_BONDS = [
     ((" N  ", " CA "), (" N  ", " H  "), (" CA ", " C  "), (" CA ", " CB "), (" CA ", " HA "), (" C  ", " O  "),
      (" CB ", "1HB "), (" CB ", "2HB "), (" CB ", "3HB ")),  # ala
@@ -482,8 +482,8 @@ AA_BONDS = [
      (" CB ", "1HB "), (" CB ", "2HB "), (" CB ", "3HB ")),  # mask
 ]
 
-# 4. 连接点定义 (Attachment Slots)
-# 定义片段上哪些原子可以与其他片段成键（通常是主链 N 和 C）
+# 4. Attachment slot definitions.
+# Define atoms that can bond to other fragments, typically backbone N and C.
 AA_TIP_ATOM = [
     " CB ", " CZ ", " ND2", " CG ", " SG ", " NE2", " CD ", " CA ", " NE2", " CD1",
     " CG ", " NZ ", " SD ", " CZ ", " CG ", " OG ", " OG1", " CH2", " OH ", " CB ",
@@ -493,17 +493,17 @@ AA_TIP_ATOM = [
 # #################################################################################### #
 
 
-# 5. 状态空间维度 (SE(3) State Space)
+# 5. SE(3) state-space dimensions.
 # Translation (3) + Rotation (6 or 9) + Type (K)
-# 注意：在 DDPM 初始化时，in_node_nf 应当等于 GEOM_NUMBER_OF_FRAGMENT_TYPES
+# During DDPM initialization, in_node_nf should equal GEOM_NUMBER_OF_FRAGMENT_TYPES.
 DATA_ATTRS_TO_PAD = {
-    'frag_positions',  # 片段质心 t
-    'frag_rotations',  # 片段旋转矩阵 R
-    'frag_features',   # 片段 One-hot ID
-    'pocket_frames'    # 口袋参考框架
+    'frag_positions',  # Fragment center t.
+    'frag_rotations',  # Fragment rotation matrix R.
+    'frag_features',   # Fragment one-hot ID.
+    'pocket_frames'    # Pocket reference frames.
 }
 
-# 理想骨架坐标（用于初始化计算）
+# Ideal backbone coordinates for initialization.
 INIT_N = torch.tensor([-0.5272, 1.3593, 0.000]).float()
 INIT_CA = torch.tensor([0.000, 0.000, 0.000]).float()
 INIT_C = torch.tensor([1.5233, 0.000, 0.000]).float()
